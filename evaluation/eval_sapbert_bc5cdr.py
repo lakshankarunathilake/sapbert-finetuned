@@ -1,13 +1,14 @@
 #!/usr/bin/env python3
 """
-SAPBERT Evaluation Script for BC5CDR-Chemical Dataset
+SAPBERT Evaluation Script for BC5CDR Dataset (Chemical and Disease)
 
-This script evaluates SAPBERT model performance on the BC5CDR-Chemical dataset
+This script evaluates SAPBERT model performance on the BC5CDR dataset
 using the search_sapbert_index functionality. It focuses on top-1 accuracy
 and provides detailed error analysis.
 
 Usage:
-    python eval_sapbert_bc5cdr.py --index_path ./utils/NEL/UMLS/indexes/Wikidata --data_dir ./data/bc5cdr-chemical
+    python eval_sapbert_bc5cdr_fixed.py --index_path ./utils/NEL/UMLS/indexes/Wikidata --data_dir ./data/bc5cdr-chemical
+    python eval_sapbert_bc5cdr_fixed.py --index_path ./utils/NEL/UMLS/indexes/Wikidata --data_dir ./data/bc5cdr-disease
 
 Features:
 - Top-1 accuracy evaluation
@@ -15,6 +16,7 @@ Features:
 - Performance metrics
 - Error categorization
 - Export of results and error cases
+- Dynamic dataset support (Chemical, Disease, etc.)
 """
 
 import os
@@ -43,7 +45,7 @@ logger = logging.getLogger(__name__)
 
 class BC5CDREvaluator:
     """
-    Evaluator for BC5CDR-Chemical dataset using SAPBERT search functionality
+    Evaluator for BC5CDR dataset (Chemical and Disease) using SAPBERT search functionality
     """
     
     def __init__(self, index_path: str, data_dir: str):
@@ -52,12 +54,12 @@ class BC5CDREvaluator:
         
         Args:
             index_path: Path to the SAPBERT index files (without extension)
-            data_dir: Path to the BC5CDR-Chemical data directory
+            data_dir: Path to the BC5CDR data directory
         """
         self.index_path = index_path
         self.data_dir = data_dir
+        self.dataset_name = os.path.basename(data_dir)
         self.searcher = None
-        self.dictionary = {}
         self.test_queries = []
         self.results = {
             'total_queries': 0,
@@ -68,31 +70,6 @@ class BC5CDREvaluator:
             'performance_metrics': {}
         }
         
-    def load_dictionary(self) -> Dict[str, str]:
-        """
-        Load the BC5CDR-Chemical dictionary
-        
-        Returns:
-            Dictionary mapping entity names to CUIs
-        """
-        dict_path = os.path.join(self.data_dir, 'test_dictionary.txt')
-        logger.info(f"Loading dictionary from: {dict_path}")
-        
-        dictionary = {}
-        with open(dict_path, 'r', encoding='utf-8') as f:
-            for line in f:
-                line = line.strip()
-                if not line:
-                    continue
-                parts = line.split('||')
-                if len(parts) >= 2:
-                    cui = parts[0]
-                    name = parts[1]
-                    dictionary[name] = cui
-                    
-        logger.info(f"Loaded {len(dictionary)} dictionary entries")
-        return dictionary
-    
     def load_test_queries(self) -> List[Dict]:
         """
         Load test queries from processed test files
@@ -109,9 +86,9 @@ class BC5CDREvaluator:
         
         for concept_file in tqdm(concept_files, desc="Loading test queries"):
             file_path = os.path.join(processed_test_dir, concept_file)
+            
             with open(file_path, 'r', encoding='utf-8') as f:
                 lines = f.readlines()
-            print(f"Read {len(lines)} lines from {file_path}")
                 
             # Group mentions by document and CUI
             doc_mentions = defaultdict(list)
@@ -123,31 +100,16 @@ class BC5CDREvaluator:
                 parts = line.split('||')
                 if len(parts) == 5:  # doc_id||start_pos|end_pos||entity_type||mention_text||cui
                     doc_id = parts[0]
-                    # Split start_pos|end_pos
-                    pos_parts = parts[1].split('|')
-                    if len(pos_parts) >= 2:
-                        start_pos = pos_parts[0]
-                        end_pos = pos_parts[1]
-                    else:
-                        continue
-                    entity_type = parts[2]
                     mention_text = parts[3]  # Index 3 is the entity name
                     cui = parts[4]          # Index 4 is the matching CUI
+                    
+                    # Process all entities regardless of type
+                    doc_mentions[doc_id].append({
+                        'mention': mention_text,
+                        'cui': cui
+                    })
                 else:
-                    print(f"Skipping line: {line}")
                     continue
-                
-                # Debug logging for first few lines
-                if len(queries) < 5:
-                    logger.debug(f"Parsed line: doc_id={doc_id}, entity_type={entity_type}, mention_text='{mention_text}', cui={cui}")
-                
-                doc_mentions[doc_id].append({
-                    'mention': mention_text,
-                    'cui': cui,
-                    'start_pos': start_pos,
-                    'end_pos': end_pos,
-                    'entity_type': entity_type
-                })
             
             # Create queries for each document
             for doc_id, mentions in doc_mentions.items():
@@ -155,10 +117,6 @@ class BC5CDREvaluator:
                 cui_mentions = defaultdict(list)
                 for mention in mentions:
                     cui_mentions[mention['cui']].append(mention['mention'])
-                
-                # Debug logging for first few documents
-                if len(queries) < 5:
-                    logger.debug(f"Document {doc_id} has {len(mentions)} mentions, {len(cui_mentions)} unique CUIs")
                 
                 # Create a query for each unique CUI
                 for cui, mention_texts in cui_mentions.items():
@@ -214,7 +172,7 @@ class BC5CDREvaluator:
         predicted_name = top_result.get('aliases', [''])[0] if top_result.get('aliases') else ''
         similarity_score = top_result.get('similarity_score', 0.0)
         
-        # Check if prediction is correct
+        # Check if prediction is correct - simplified CUI matching
         is_correct = self.check_cui_match(predicted_cui, golden_cui)
         
         error_type = None
@@ -236,8 +194,8 @@ class BC5CDREvaluator:
         Check if predicted CUI matches golden CUI
         
         Args:
-            predicted_cui: Predicted entity ID
-            golden_cui: Golden standard CUI
+            predicted_cui: Predicted entity ID from SAPBERT search
+            golden_cui: Golden standard CUI from concept file
             
         Returns:
             True if match, False otherwise
@@ -245,15 +203,8 @@ class BC5CDREvaluator:
         if not predicted_cui or not golden_cui:
             return False
         
-        # Direct match
-        if predicted_cui == golden_cui:
-            return True
-        
-        # Check if predicted CUI is in the dictionary and maps to golden CUI
-        if predicted_cui in self.dictionary:
-            return self.dictionary[predicted_cui] == golden_cui
-        
-        return False
+        # Direct CUI match - this is the primary comparison
+        return predicted_cui == golden_cui
     
     def categorize_error(self, predicted_cui: str, golden_cui: str, query_text: str, predicted_name: str) -> str:
         """
@@ -288,10 +239,9 @@ class BC5CDREvaluator:
         Returns:
             Evaluation results dictionary
         """
-        logger.info("Starting BC5CDR-Chemical evaluation")
+        logger.info(f"Starting BC5CDR-{self.dataset_name} evaluation")
         
         # Load data
-        self.dictionary = self.load_dictionary()
         self.test_queries = self.load_test_queries()
         
         # Initialize searcher
@@ -376,11 +326,11 @@ class BC5CDREvaluator:
         
         error_df = pd.DataFrame(error_data)
         
-        # Generate report
-        report_path = os.path.join(output_dir, 'bc5cdr_chemical_error_analysis.txt')
+        # Generate report with dynamic naming
+        report_path = os.path.join(output_dir, f'{self.dataset_name}_error_analysis.txt')
         
         with open(report_path, 'w', encoding='utf-8') as f:
-            f.write("BC5CDR-Chemical SAPBERT Evaluation Error Analysis\n")
+            f.write(f"BC5CDR-{self.dataset_name.title()} SAPBERT Evaluation Error Analysis\n")
             f.write("=" * 60 + "\n\n")
             
             # Summary statistics
@@ -441,7 +391,8 @@ class BC5CDREvaluator:
         if output_dir is None:
             output_dir = os.path.dirname(__file__)
         
-        results_path = os.path.join(output_dir, 'bc5cdr_chemical_evaluation_results.json')
+        # Generate results file with dynamic naming
+        results_path = os.path.join(output_dir, f'{self.dataset_name}_evaluation_results.json')
         
         # Convert numpy types to Python types for JSON serialization
         def convert_numpy(obj):
@@ -466,18 +417,21 @@ class BC5CDREvaluator:
 def parse_arguments():
     """Parse command line arguments"""
     parser = argparse.ArgumentParser(
-        description='Evaluate SAPBERT on BC5CDR-Chemical dataset',
+        description='Evaluate SAPBERT on BC5CDR dataset (Chemical and Disease)',
         formatter_class=argparse.RawDescriptionHelpFormatter,
         epilog="""
 Examples:
-  # Basic evaluation
-  python eval_sapbert_bc5cdr.py --index_path ./utils/NEL/UMLS/indexes/Wikidata --data_dir ./data/bc5cdr-chemical
+  # Chemical dataset evaluation
+  python eval_sapbert_bc5cdr_fixed.py --index_path ./utils/NEL/UMLS/indexes/Wikidata --data_dir ./data/bc5cdr-chemical
+
+  # Disease dataset evaluation
+  python eval_sapbert_bc5cdr_fixed.py --index_path ./utils/NEL/UMLS/indexes/Wikidata --data_dir ./data/bc5cdr-disease
 
   # Evaluation with custom output directory
-  python eval_sapbert_bc5cdr.py --index_path ./utils/NEL/UMLS/indexes/Wikidata --data_dir ./data/bc5cdr-chemical --output_dir ./results
+  python eval_sapbert_bc5cdr_fixed.py --index_path ./utils/NEL/UMLS/indexes/Wikidata --data_dir ./data/bc5cdr-chemical --output_dir ./results
 
   # Evaluation with verbose logging
-  python eval_sapbert_bc5cdr.py --index_path ./utils/NEL/UMLS/indexes/Wikidata --data_dir ./data/bc5cdr-chemical --verbose
+  python eval_sapbert_bc5cdr_fixed.py --index_path ./utils/NEL/UMLS/indexes/Wikidata --data_dir ./data/bc5cdr-chemical --verbose
         """
     )
     
@@ -492,7 +446,7 @@ Examples:
         '--data_dir',
         type=str,
         required=True,
-        help='Path to BC5CDR-Chemical data directory'
+        help='Path to BC5CDR data directory (chemical or disease)'
     )
     
     parser.add_argument(
@@ -519,8 +473,9 @@ def main():
     if args.verbose:
         logging.getLogger().setLevel(logging.DEBUG)
     
+    dataset_name = os.path.basename(args.data_dir)
     print("=" * 60)
-    print("SAPBERT BC5CDR-Chemical Evaluation")
+    print(f"SAPBERT BC5CDR-{dataset_name.title()} Evaluation")
     print("=" * 60)
     
     try:
