@@ -194,7 +194,7 @@ class SAPBERTIndexSearcher:
                k: int = 10,
                return_scores: bool = True) -> List[Dict]:
         """
-        Search for similar entities
+        Search for similar entities - FIXED VERSION
 
         Args:
             query_text: Text to search for
@@ -210,8 +210,12 @@ class SAPBERTIndexSearcher:
         # Load model for query embedding
         self._load_model()
 
-        # Generate query embedding
-        query_embedding = self._generate_single_embedding(query_text)
+        # FIX 1: Get max_length from index config to match index creation
+        max_length = self.index_config.get('max_length', 16)
+        logger.debug(f"Using max_length={max_length} for search (from index config)")
+
+        # Generate query embedding with SAME max_length as index
+        query_embedding = self._generate_single_embedding(query_text, max_length)
 
         # Normalize query embedding
         query_embedding = query_embedding.reshape(1, -1).astype(np.float32)
@@ -220,7 +224,7 @@ class SAPBERTIndexSearcher:
         # Search
         scores, indices = self.index.search(query_embedding, k)
 
-        # Prepare results
+        # FIX 2: Correct ranking logic - filter FIRST, rank LAST
         results = []
         seen_entities = set()  # Track entities to avoid duplicates
 
@@ -238,7 +242,6 @@ class SAPBERTIndexSearcher:
 
             if return_scores:
                 result['similarity_score'] = float(score)
-            result['rank'] = len(results) + 1  # Rank based on unique entities
 
             # For backward compatibility, ensure 'aliases' field exists
             if 'all_aliases' in result:
@@ -249,9 +252,10 @@ class SAPBERTIndexSearcher:
         # Sort results by similarity score in descending order (highest first)
         if return_scores and results:
             results.sort(key=lambda x: x['similarity_score'], reverse=True)
-            # Update ranks after sorting
-            for i, result in enumerate(results):
-                result['rank'] = i + 1
+
+        # Assign ranks AFTER sorting and filtering
+        for i, result in enumerate(results):
+            result['rank'] = i + 1
 
         return results
 
@@ -305,7 +309,8 @@ class SAPBERTIndexSearcher:
             "model_name": self.index_config.get('model_name', 'Unknown'),
             "is_trained": getattr(self.index, 'is_trained', True),
             "created_at": self.index_config.get('created_at', 'Unknown'),
-            "processing_time_minutes": self.index_config.get('processing_time_minutes', 'Unknown')
+            "processing_time_minutes": self.index_config.get('processing_time_minutes', 'Unknown'),
+            "max_length": self.index_config.get('max_length', 'Unknown')
         }
 
         return stats
@@ -347,7 +352,7 @@ class SAPBERTIndexSearcher:
 
     def debug_embedding(self, text: str) -> Dict:
         """
-        Debug function to check embedding generation for a specific text
+        Debug function to check embedding generation for a specific text - FIXED VERSION
 
         Args:
             text: Text to generate embedding for
@@ -357,12 +362,16 @@ class SAPBERTIndexSearcher:
         """
         self._load_model()
 
-        # Generate embedding
-        embedding = self._generate_single_embedding(text)
+        # Use same max_length as index if available
+        max_length = self.index_config.get('max_length', 16)
+
+        # Generate embedding with consistent parameters
+        embedding = self._generate_single_embedding(text, max_length)
 
         # Calculate statistics
         stats = {
             'text': text,
+            'max_length_used': max_length,
             'embedding_shape': embedding.shape,
             'embedding_norm': np.linalg.norm(embedding),
             'embedding_mean': np.mean(embedding),
@@ -573,6 +582,7 @@ def debug_mode(searcher, args):
     stats = searcher.debug_embedding(args.query)
 
     print(f"Text: {stats['text']}")
+    print(f"Max Length Used: {stats['max_length_used']}")
     print(f"Embedding Shape: {stats['embedding_shape']}")
     print(f"Embedding Norm: {stats['embedding_norm']:.6f}")
     print(f"Embedding Mean: {stats['embedding_mean']:.6f}")
@@ -606,6 +616,7 @@ def stats_mode(searcher, args):
     print(f"Is Trained: {stats['is_trained']}")
     print(f"Created At: {stats['created_at']}")
     print(f"Processing Time: {stats['processing_time_minutes']} minutes")
+    print(f"Max Length: {stats['max_length']}")
 
     return stats
 
@@ -618,7 +629,7 @@ def main():
         logging.getLogger().setLevel(logging.DEBUG)
 
     print("=" * 60)
-    print("SAPBERT FAISS Index Searcher")
+    print("SAPBERT FAISS Index Searcher - FIXED VERSION")
     print("=" * 60)
 
     try:
@@ -631,6 +642,7 @@ def main():
         print(f"   Entities: {len(searcher.metadata):,}")
         print(f"   Model: {config.get('model_name', 'Unknown')}")
         print(f"   Type: {config.get('index_type', 'Unknown')}")
+        print(f"   Max Length: {config.get('max_length', 'Unknown')}")
 
         # Execute based on mode
         results = None

@@ -149,6 +149,12 @@ class SAPBERTIndexCreator:
         self._load_model()
         embeddings = []
 
+        # Reduce batch size on Mac to avoid memory issues
+        import platform
+        if platform.system() == "Darwin":  # macOS
+            batch_size = min(batch_size, 8)
+            logger.info(f"Running on macOS, reducing batch size to {batch_size}")
+
         logger.info(f"Using max_length={max_length} for tokenization")
 
         for i in tqdm(range(0, len(texts), batch_size), desc="Generating embeddings"):
@@ -330,9 +336,10 @@ class SAPBERTIndexCreator:
     def create_index_from_csv(self,
                               csv_path: str,
                               output_dir: str,
-                              index_name: str = "wikidata_index",
+                              index_name: str = "entities_index",
                               index_type: str = "IVF",
-                              batch_size: int = 16) -> str:
+                              batch_size: int = 16,
+                              max_length: int = 16) -> str:
         """
         Create FAISS index from CSV file and save to disk
 
@@ -408,7 +415,7 @@ class SAPBERTIndexCreator:
 
         # Generate embeddings
         logger.info("Generating embeddings...")
-        embeddings = self._generate_embeddings_batch(all_texts, batch_size, max_length=16)
+        embeddings = self._generate_embeddings_batch(all_texts, batch_size, max_length)
         self.embedding_dim = embeddings.shape[1]
 
         # Build FAISS index
@@ -427,6 +434,7 @@ class SAPBERTIndexCreator:
             'num_entities': len(processed_data),
             'created_at': time.strftime('%Y-%m-%d %H:%M:%S'),
             'processing_time_minutes': (time.time() - start_time) / 60,
+            'max_length': max_length,  # <--- ADD THIS LINE
             'source_columns': {
                 'id_column': id_column,
                 'aliases_column': aliases_column
@@ -477,10 +485,10 @@ Examples:
       --index_type HNSW \
       --batch_size 64
 
-Index Types:
-  Flat: Maximum accuracy, slower search (best for <100K entities)
-  IVF:  Good balance of accuracy and speed (recommended)
-  HNSW: Fastest search, slight accuracy trade-off (best for >1M entities)
+Index Types (Accuracy vs Speed):
+  Flat: Maximum accuracy (100% exact), slower search - use for small datasets or when perfect accuracy needed
+  IVF:  High accuracy (~95-99%), good search speed - RECOMMENDED for most use cases
+  HNSW: Good accuracy (~90-95%), fastest search - use for very large datasets when speed is critical
         """
     )
 
@@ -510,7 +518,7 @@ Index Types:
         type=str,
         choices=['Flat', 'IVF', 'HNSW'],
         default='IVF',
-        help='FAISS index type (default: IVF)'
+        help='FAISS index type - Flat: best accuracy, IVF: balanced (recommended), HNSW: fastest search (default: IVF)'
     )
 
     parser.add_argument(
@@ -536,8 +544,8 @@ Index Types:
     parser.add_argument(
         '--max_length',
         type=int,
-        default=25,
-        help='Maximum sequence length for tokenization (default: 25, good for entity names)'
+        default=16,
+        help='Maximum sequence length for tokenization (default: 16, good for entity names)'
     )
 
     parser.add_argument(
@@ -654,7 +662,8 @@ def main():
             output_dir=args.output_dir,
             index_name=args.index_name,
             index_type=args.index_type,
-            batch_size=args.batch_size
+            batch_size=args.batch_size,
+            max_length=args.max_length
         )
 
         # Show success message
