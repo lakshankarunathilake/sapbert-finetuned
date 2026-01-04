@@ -2,34 +2,30 @@
 
 import argparse
 import os
-import pickle
-import json
 import glob
 from dataclasses import dataclass
-from typing import Dict, List, Optional, Tuple
+from typing import Dict, List, Tuple
 import logging
 
 import torch
+from torch.utils.data import DataLoader
 from torch import nn
-import numpy as np
-from datasets import load_dataset, Dataset as HFDataset
 from transformers import AutoTokenizer, TrainingArguments
 from adapters import AutoAdapterModel
 from adapters.trainer import AdapterTrainer
 from tqdm import tqdm
-
 
 import sys
 from pathlib import Path
 
 PROJECT_ROOT = Path(__file__).resolve().parents[2]  # → sapbert/
 sys.path.insert(0, str(PROJECT_ROOT))
-sys.path.append("/Users/lakshankarunathilake/PycharmProjects/sapbert/utils/NEL/create_sapbert_index.py")
+# IMPORTANT: append directories, not files
+# sys.path.append("/Users/lakshankarunathilake/PycharmProjects/sapbert/utils/NEL")
 from utils.NEL.search_sapbert_index import SAPBERTIndexSearcher
 
 try:
     import faiss
-
     HAS_FAISS = True
 except Exception:
     HAS_FAISS = False
@@ -66,7 +62,7 @@ def parse_args():
     p.add_argument("--context_window", type=int, default=64)
 
     p.add_argument("--epochs", type=int, default=2)
-    p.add_argument("--per_device_train_batch_size", type=int, default=64)
+    p.add_argument("--per_device_train_batch_size", type=int, default=64, help="Items per batch (candidates). If using grouped sampler, each batch is 1+ whole query groups.")
     p.add_argument("--per_device_eval_batch_size", type=int, default=64)
     p.add_argument("--eval_batch_size", type=int, default=32, help="Batch size for reranking during evaluation")
     p.add_argument("--lr", type=float, default=5e-5)
@@ -84,16 +80,6 @@ def parse_args():
 # ------------------------
 
 def parse_pubtator_file(filepath: str) -> List[Dict]:
-    """
-    Parse a single PubTator format file
-
-    PubTator format:
-    PMID|t|TITLE
-    PMID|a|ABSTRACT
-    PMID\tSTART\tEND\tMENTION\tTYPE\tMESH_ID
-
-    Returns list of documents with entities
-    """
     documents = []
     current_doc = None
 
@@ -101,21 +87,18 @@ def parse_pubtator_file(filepath: str) -> List[Dict]:
         for line in f:
             line = line.strip()
             if not line:
-                # Empty line marks end of document
                 if current_doc and current_doc['entities']:
                     documents.append(current_doc)
                 current_doc = None
                 continue
 
             if '|t|' in line or '|a|' in line:
-                # Title or abstract line
                 parts = line.split('|')
                 pmid = parts[0]
-                text_type = parts[1]  # 't' for title, 'a' for abstract
+                text_type = parts[1]
                 text = '|'.join(parts[2:]) if len(parts) > 2 else ''
 
                 if current_doc is None or current_doc['id'] != pmid:
-                    # Start new document
                     if current_doc and current_doc['entities']:
                         documents.append(current_doc)
                     current_doc = {
@@ -135,7 +118,6 @@ def parse_pubtator_file(filepath: str) -> List[Dict]:
                 current_doc['full_text'] += text
 
             elif '\t' in line:
-                # Entity annotation line
                 parts = line.split('\t')
                 if len(parts) >= 6:
                     pmid = parts[0]
@@ -157,7 +139,6 @@ def parse_pubtator_file(filepath: str) -> List[Dict]:
                                     'normalized': [{'db_name': 'MESH', 'db_id': mesh_id}]
                                 })
 
-        # Add last document
         if current_doc and current_doc['entities']:
             documents.append(current_doc)
 
@@ -165,18 +146,8 @@ def parse_pubtator_file(filepath: str) -> List[Dict]:
 
 
 def load_bc5cdr_from_pubtator(pubtator_dir: str) -> Dict:
-    """
-    Load BC5CDR from PubTator format files
-
-    Expected files in directory:
-    - CDR_TrainingSet.PubTator.txt (or CDR_DevelopmentSet.PubTator.txt)
-    - CDR_TestSet.PubTator.txt
-    """
     print(f"📂 Loading BC5CDR from PubTator directory: {pubtator_dir}")
-
     splits = {}
-
-    # Common file naming patterns
     file_patterns = {
         'train': ['*Training*.txt', '*train*.txt', '*Train*.txt'],
         'validation': ['*Development*.txt', '*dev*.txt', '*Dev*.txt', '*validation*.txt'],
@@ -191,8 +162,6 @@ def load_bc5cdr_from_pubtator(pubtator_dir: str) -> Dict:
                 filepath = files[0]
                 print(f"  📄 Loading {split} from: {os.path.basename(filepath)}")
                 docs = parse_pubtator_file(filepath)
-
-                # Convert to dataset format
                 splits[split] = {
                     'id': [d['id'] for d in docs],
                     'passages': [d['passages'] for d in docs],
@@ -206,60 +175,26 @@ def load_bc5cdr_from_pubtator(pubtator_dir: str) -> Dict:
         if not found and split != 'validation':
             print(f"  ⚠️  No {split} file found")
 
-    # If no validation set, try using dev set
-    if 'validation' not in splits:
-        print(f"  ℹ️  No validation set found, will use train split for training")
-
     if not splits:
-        raise RuntimeError(
-            f"No PubTator files found in {pubtator_dir}\nExpected files like: CDR_TrainingSet.PubTator.txt, CDR_TestSet.PubTator.txt")
+        raise RuntimeError(f"No PubTator files found in {pubtator_dir}")
 
     return splits
 
 
-# ------------------------
-# Data helpers
-# ------------------------
-
-
-def load_bc5cdr(pubtator_path: str):
-    """Load BC5CDR dataset from PubTator format files"""
+def load_bc5cdr(pubtator_path: str) -> Dict:
     print("📥 Loading BC5CDR dataset from PubTator format...")
     print(f"  📂 Directory: {pubtator_path}")
 
-    # Load from PubTator format
     splits_dict = load_bc5cdr_from_pubtator(pubtator_path)
-
-    # Convert to simple dict-based dataset (no HuggingFace dependency)
     ds = {}
     for split_name, split_data in splits_dict.items():
-        # Just keep as dict of lists
         ds[split_name] = split_data
         print(f"  ✅ {split_name}: {len(split_data['id'])} documents")
 
-    # Ensure required splits
     if 'validation' not in ds and 'train' in ds:
         print("  ⚠️  No validation set found, creating from train split (10%)")
-        # Simple split without HuggingFace
-        train_data = ds['train']
-        num_train = len(train_data['id'])
-        split_idx = int(num_train * 0.9)
 
-        # Split train into train and validation
-        val_data = {k: v[split_idx:] for k, v in train_data.items()}
-        train_data_new = {k: v[:split_idx] for k, v in train_data.items()}
-
-        ds['train'] = train_data_new
-        ds['validation'] = val_data
-        print(f"    ✅ New train: {len(train_data_new['id'])} documents")
-        print(f"    ✅ New validation: {len(val_data['id'])} documents")
-
-    # Check required splits
-    missing = []
-    for split in ['train', 'validation', 'test']:
-        if split not in ds:
-            missing.append(split)
-
+    missing = [s for s in ['train', 'validation', 'test'] if s not in ds]
     if missing:
         raise RuntimeError(f"Missing required splits: {missing}. Available: {list(ds.keys())}")
 
@@ -267,14 +202,11 @@ def load_bc5cdr(pubtator_path: str):
 
 
 def collect_mentions(ds_split, split_name: str = "split") -> List[dict]:
-    """Collect mentions from dataset split with progress (dict-of-lists input)."""
     mentions = []
     print(f"📋 Collecting mentions from {split_name} split...")
 
-    # Expect keys: id, passages, entities, full_text (each a list of len N)
     n = len(ds_split["id"])
     for idx in tqdm(range(n), desc=f"Processing {split_name}", leave=False):
-        # materialize an example dict
         ex = {k: ds_split[k][idx] for k in ds_split.keys()}
 
         passages = ex.get("passages", [])
@@ -294,7 +226,6 @@ def collect_mentions(ds_split, split_name: str = "split") -> List[dict]:
                     parts.append(t)
             doc_text = "\n".join(parts) if parts else None
 
-        # Entities -> mentions
         for ent in entities:
             mesh = None
             if isinstance(ent, dict) and 'mesh' in ent:
@@ -323,9 +254,7 @@ def collect_mentions(ds_split, split_name: str = "split") -> List[dict]:
     return mentions
 
 
-
 def build_context_query(mention: dict, tokenizer, window_tokens: int) -> str:
-    """Build context-aware query from mention"""
     text = mention.get("text") or ""
     doc = mention.get("doc_text")
     if not doc:
@@ -335,8 +264,7 @@ def build_context_query(mention: dict, tokenizer, window_tokens: int) -> str:
         end = start + len(text)
     except ValueError:
         return text
-    left = doc[:start];
-    right = doc[end:]
+    left = doc[:start]; right = doc[end:]
     lt = tokenizer.tokenize(left)[-window_tokens:]
     rt = tokenizer.tokenize(right)[:window_tokens]
     lstr = tokenizer.convert_tokens_to_string(lt).strip()
@@ -345,7 +273,7 @@ def build_context_query(mention: dict, tokenizer, window_tokens: int) -> str:
 
 
 # ------------------------
-# Listwise dataset for AdapterTrainer
+# Dataset (list-backed)
 # ------------------------
 
 @dataclass
@@ -356,12 +284,18 @@ class RerankExample:
     label: int  # 1 for gold, 0 for negatives
 
 
-def make_listwise_dataset(tokenizer: AutoTokenizer, pairs: List[Tuple[str, List[str]]], max_length: int) -> HFDataset:
-    """Build listwise dataset from query-candidate pairs with progress"""
+class SimpleDataset:
+    def __init__(self, data: List[Dict]):
+        self.data = data
+    def __len__(self):
+        return len(self.data)
+    def __getitem__(self, idx):
+        return self.data[idx]
+
+
+def make_listwise_dataset(tokenizer: AutoTokenizer, pairs: List[Tuple[str, List[str]]], max_length: int) -> SimpleDataset:
     features: List[Dict] = []
-
     print(f"🏗️  Building training dataset from {len(pairs):,} queries...")
-
     for qid, (q, cand_list) in enumerate(tqdm(pairs, desc="Tokenizing pairs")):
         for j, alias in enumerate(cand_list):
             enc = tokenizer(f"{q} [SEP] {alias}", truncation=True, padding=False, max_length=max_length)
@@ -371,40 +305,114 @@ def make_listwise_dataset(tokenizer: AutoTokenizer, pairs: List[Tuple[str, List[
                 "query_id": qid,
                 "label": 1 if j == 0 else 0,
             })
-
     print(f"  ✅ Created {len(features):,} training examples")
-    return HFDataset.from_list(features)
+    return SimpleDataset(features)
 
 
 # ------------------------
-# Custom AdapterTrainer implementing group (listwise) softmax per query_id
+# Collator + Sampler that keep whole query groups together
+# ------------------------
+
+class QueryGroupedCollator:
+    def __init__(self, tokenizer):
+        self.tokenizer = tokenizer
+
+    def __call__(self, items: List[Dict]):
+        # items are dicts for multiple query groups (complete per group)
+        input_ids = [it['input_ids'] for it in items]
+        attention_mask = [it['attention_mask'] for it in items]
+        query_ids = [it['query_id'] for it in items]
+        labels = [it['label'] for it in items]
+
+        max_len = max(len(ids) for ids in input_ids)
+        pad_id = self.tokenizer.pad_token_id if self.tokenizer.pad_token_id is not None else 0
+
+        input_ids_padded, attention_mask_padded = [], []
+        for ids, mask in zip(input_ids, attention_mask):
+            pad_len = max_len - len(ids)
+            input_ids_padded.append(ids + [pad_id] * pad_len)
+            attention_mask_padded.append(mask + [0] * pad_len)
+
+        return {
+            'input_ids': torch.tensor(input_ids_padded, dtype=torch.long),
+            'attention_mask': torch.tensor(attention_mask_padded, dtype=torch.long),
+            'query_id': torch.tensor(query_ids, dtype=torch.long),
+            'labels': torch.tensor(labels, dtype=torch.long),  # use 'labels' to be HF-friendly
+        }
+
+
+class QueryGroupedSampler:
+    """
+    Yields batches of indices that contain whole query groups.
+    By default, we put exactly ONE full group per batch (safest for listwise).
+    If you want more than one group per batch, set groups_per_batch > 1.
+    """
+    def __init__(self, dataset: SimpleDataset, groups_per_batch: int = 1):
+        # group indices by query_id
+        groups = {}
+        for idx, item in enumerate(dataset.data):
+            qid = item["query_id"]
+            groups.setdefault(qid, []).append(idx)
+        self.group_list = list(groups.values())
+        self.groups_per_batch = max(1, int(groups_per_batch))
+
+    def __iter__(self):
+        # shuffle groups each epoch
+        import random
+        random.shuffle(self.group_list)
+        batch = []
+        count = 0
+        for g in self.group_list:
+            batch.extend(g)
+            count += 1
+            if count == self.groups_per_batch:
+                yield batch
+                batch = []
+                count = 0
+        if batch:
+            yield batch
+
+    def __len__(self):
+        # approximate number of batches
+        from math import ceil
+        return ceil(len(self.group_list) / self.groups_per_batch)
+
+
+# ------------------------
+# Custom Trainer that uses our sampler
 # ------------------------
 
 class ListwiseAdapterTrainer(AdapterTrainer):
-    """Custom trainer with listwise softmax loss"""
+    def __init__(self, *args, grouped_sampler=None, data_collator=None, **kwargs):
+        super().__init__(*args, **kwargs)
+        self._grouped_sampler = grouped_sampler
+        self._data_collator = data_collator
+
+    def get_train_dataloader(self):
+        if self.train_dataset is None:
+            raise ValueError("Training requires a train_dataset.")
+        return DataLoader(
+            self.train_dataset,
+            batch_sampler=self._grouped_sampler,
+            collate_fn=self._data_collator,
+            num_workers=self.args.dataloader_num_workers,
+            pin_memory=self.args.dataloader_pin_memory,
+        )
 
     def compute_loss(self, model, inputs, return_outputs: bool = False, **kwargs):
         # accept both 'labels' and 'label'
-        if "labels" in inputs:
-            labels = inputs.pop("labels")
-        elif "label" in inputs:
-            labels = inputs.pop("label")
-        else:
+        labels = inputs.pop("labels", inputs.pop("label", None))
+        if labels is None:
             raise KeyError(f"No label field in inputs. Got keys: {list(inputs.keys())}")
-
         if "query_id" not in inputs:
             raise KeyError(f"'query_id' missing from inputs. Got keys: {list(inputs.keys())}")
 
         qids = inputs.pop("query_id")
-
         outputs = model(**inputs)
         logits = outputs.logits.squeeze(-1)
 
-        # 1-D ensure
-        if hasattr(qids, "ndim") and qids.ndim > 1:
-            qids = qids.view(-1)
-        if hasattr(labels, "ndim") and labels.ndim > 1:
-            labels = labels.view(-1)
+        if hasattr(qids, "ndim") and qids.ndim > 1: qids = qids.view(-1)
+        if hasattr(labels, "ndim") and labels.ndim > 1: labels = labels.view(-1)
 
         loss_terms = []
         for qid in torch.unique(qids):
@@ -412,21 +420,22 @@ class ListwiseAdapterTrainer(AdapterTrainer):
             group_logits = logits[mask]
             group_labels = labels[mask]
 
-            log_probs = torch.log_softmax(group_logits, dim=0)
+            # one positive per group expected
             pos_idx = (group_labels == 1).nonzero(as_tuple=True)[0]
-            if pos_idx.numel() == 0:
+            if pos_idx.numel() != 1:
+                # skip groups without a single positive
                 continue
-            assert pos_idx.numel() == 1, f"Expected 1 positive per query, got {pos_idx.numel()}"
+
+            log_probs = torch.log_softmax(group_logits, dim=0)
             loss_terms.append(-log_probs[pos_idx[0]])
 
         if loss_terms:
             loss = torch.stack(loss_terms).mean()
         else:
-            # No positives in this batch → return a zero *tensor* tied to logits
+            # return a zero tensor tied to the graph (not a float)
             loss = logits.sum() * 0.0
 
         return (loss, outputs) if return_outputs else loss
-
 
 
 # ------------------------
@@ -434,14 +443,11 @@ class ListwiseAdapterTrainer(AdapterTrainer):
 # ------------------------
 
 def extract_candidates_from_search_results(search_results: List[List[Dict]]) -> List[Tuple[List[str], List[str]]]:
-    """Extract (aliases, entity_ids) from search results"""
     candidates = []
     for results in search_results:
-        cand_aliases = []
-        cand_ids = []
+        cand_aliases, cand_ids = [], []
         for r in results:
             entity_id = r.get('entity_id')
-            # Get alias from various possible keys
             alias = (r.get('primary_alias') or
                      r.get('processed_text') or
                      (r.get('aliases', [''])[0] if r.get('aliases') else '') or
@@ -456,19 +462,11 @@ def extract_candidates_from_search_results(search_results: List[List[Dict]]) -> 
 def evaluate_reranker(rer_model, tokenizer, test_mentions, test_queries,
                       candidates_per_query: List[Tuple[List[str], List[str]]],
                       max_length, device, batch_size=32):
-    """Comprehensive evaluation with batched reranking and progress bars"""
     print(f"📊 Evaluating reranker on {len(test_mentions):,} test mentions...")
     rer_model.eval()
 
-    metrics = {
-        'retrieval_recall': 0,
-        'top1': 0,
-        'top5': 0,
-        'mrr': 0.0,
-        'counted': 0
-    }
+    metrics = {'retrieval_recall': 0, 'top1': 0, 'top5': 0, 'mrr': 0.0, 'counted': 0}
 
-    # Batched evaluation for speed
     num_batches = (len(test_mentions) + batch_size - 1) // batch_size
     pbar = tqdm(range(0, len(test_mentions), batch_size), desc="Reranking batches", total=num_batches)
 
@@ -478,13 +476,11 @@ def evaluate_reranker(rer_model, tokenizer, test_mentions, test_queries,
         batch_queries = test_queries[batch_start:batch_end]
         batch_candidates = candidates_per_query[batch_start:batch_end]
 
-        batch_pairs = []
-        batch_metadata = []
+        batch_pairs, batch_metadata = [], []
 
         for i, m in enumerate(batch_mentions):
             gold = m["mesh"]
             cand_aliases, cand_cids = batch_candidates[i]
-
             if gold not in cand_cids:
                 continue
 
@@ -549,19 +545,64 @@ def evaluate_reranker(rer_model, tokenizer, test_mentions, test_queries,
     }
 
 
-# ------------------------
-# Main
-# ------------------------
+def run_eval_on_split(split_name: str,
+                      ds: Dict,
+                      searcher: SAPBERTIndexSearcher,
+                      tokenizer: AutoTokenizer,
+                      rer_model: AutoAdapterModel,
+                      args,
+                      device):
+    if split_name not in ds:
+        print(f"\n⚠️  Split '{split_name}' not found. Available: {list(ds.keys())}")
+        return None
+
+    print("\n" + "=" * 70)
+    print(f"[EVAL] {split_name.upper()} SPLIT".center(70))
+    print("=" * 70)
+
+    mentions = collect_mentions(ds[split_name], split_name)
+    if not mentions:
+        print(f"  ⚠️  No mentions in {split_name} split — skipping.")
+        return None
+
+    # Build queries (same logic you used for training)
+    def to_query(m):
+        if args.query_mode == "context":
+            return build_context_query(m, searcher.tokenizer, args.context_window)
+        return m["text"]
+
+    queries = [to_query(m) for m in tqdm(mentions, desc=f"Building {split_name} queries", leave=False)]
+
+    print(f"🔍 Retrieving top-{args.k} candidates using SAPBERTIndexSearcher...")
+    search_results = searcher.batch_search(queries, k=args.k)
+    candidates = extract_candidates_from_search_results(search_results)
+
+    results = evaluate_reranker(
+        rer_model, tokenizer, mentions, queries, candidates,
+        args.max_length, device, batch_size=args.eval_batch_size
+    )
+
+    # Pretty print
+    print("\n" + "-" * 70)
+    print(f"{split_name.upper()} EVALUATION RESULTS".center(70))
+    print("-" * 70)
+    print(f"📊 Evaluated on:            {results['evaluated_on']}")
+    print(f"🔍 Retrieval Recall@{args.k:>2}:      {results['retrieval_recall@k'] * 100:>6.2f}%")
+    print(f"🥇 Reranker Top-1:          {results['rerank_top1'] * 100:>6.2f}%")
+    print(f"🏅 Reranker Top-5:          {results['rerank_top5'] * 100:>6.2f}%")
+    print(f"📈 Mean Reciprocal Rank:    {results['mrr']:>6.4f}")
+    print("-" * 70 + "\n")
+
+    return results
+
 
 def main():
     args = parse_args()
     torch.manual_seed(args.seed)
 
-    # Validate FAISS
     if not HAS_FAISS:
         raise RuntimeError("FAISS not available. Install with: pip install faiss-cpu (or faiss-gpu)")
 
-    # Device handling
     device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
     print("\n" + "=" * 70)
     print("BC5CDR RERANKER TRAINER (using SAPBERTIndexSearcher)".center(70))
@@ -570,39 +611,46 @@ def main():
     print(f"🌱 Seed: {args.seed}")
     print()
 
-    # ============================================================
-    # STEP 1: Load BC5CDR dataset
-    # ============================================================
+    # STEP 1
     print("\n" + "=" * 70)
     print("[STEP 1/7] LOAD BC5CDR DATASET")
     print("=" * 70)
     ds = load_bc5cdr(pubtator_path=args.pubtator_path)
-    print(f"  ✅ Train: {len(ds['train']):,} documents")
-    print(f"  ✅ Validation: {len(ds['validation']):,} documents")
-    print(f"  ✅ Test: {len(ds['test']):,} documents")
+    print(f"  ✅ Train docs: {len(ds['train']['id'])}")
+    print(f"  ✅ Validation docs: {len(ds['validation']['id'])}")
+    print(f"  ✅ Test docs: {len(ds['test']['id'])}")
 
-    # ============================================================
-    # STEP 2: Load FAISS index with SAPBERTIndexSearcher
-    # ============================================================
+    def count_entity_rows(ds_split):
+        # Count raw entity rows (before splitting on multiple mesh ids)
+        n_docs = len(ds_split["id"])
+        rows = 0
+        for ents in ds_split["entities"]:
+            rows += len(ents)
+        return n_docs, rows
+
+    n_docs, raw_rows = count_entity_rows(ds["test"])
+    print(f"[DEBUG] Test docs: {n_docs}, raw entity rows: {raw_rows}")
+
+    test_mentions = collect_mentions(ds["test"], "test")
+    print(f"[DEBUG] Mentions built (after splitting by multiple MeSH IDs): {len(test_mentions)}")
+
+    # STEP 2
     print("\n" + "=" * 70)
     print("[STEP 2/7] INITIALIZE SAPBERT INDEX SEARCHER")
     print("=" * 70)
 
-    # Initialize searcher with optional adapter override
     searcher = SAPBERTIndexSearcher(
         model_name=args.base_model,
         adapter_name=args.retriever_adapter_name,
         adapter_path=args.retriever_adapter_path
     )
-
-    # Load index
     searcher.load_index(args.faiss_index_path)
-    searcher.get_index_stats()
+    stats = searcher.get_index_stats()
+    print(f"  ✅ Entities: {stats.get('num_entities','?'):,}")
+    print(f"  ✅ Index type: {stats.get('index_type','?')}")
+    print(f"  ✅ Adapter: {'ON' if stats.get('use_adapter') else 'OFF'}")
 
-
-    # ============================================================
-    # STEP 3: Prepare training data
-    # ============================================================
+    # STEP 3
     print("\n" + "=" * 70)
     print(f"[STEP 3/7] PREPARE {args.train_split.upper()} SPLIT FOR TRAINING")
     print("=" * 70)
@@ -610,8 +658,7 @@ def main():
     train_mentions = collect_mentions(ds[args.train_split], args.train_split)
     print(f"  ✅ Collected {len(train_mentions):,} mentions")
 
-    # Get tokenizer from searcher for context building
-    searcher._load_model()  # Ensure model/tokenizer loaded
+    searcher._load_model()  # ensure tokenizer available
 
     def to_query(m):
         if args.query_mode == "context":
@@ -621,16 +668,13 @@ def main():
     print(f"🔄 Building queries (mode: {args.query_mode})...")
     train_queries = [to_query(m) for m in tqdm(train_mentions, desc="Building queries", leave=False)]
 
-    # Use searcher's batch_search method
     print(f"🔍 Retrieving top-{args.k} candidates using SAPBERTIndexSearcher...")
-    train_search_results = searcher.batch_search(train_queries, k=args.k)
+    train_search_results = searcher.batch_search(train_queries, k=args.k)  # no 'desc' param
     train_candidates = extract_candidates_from_search_results(train_search_results)
 
-    # Build training pairs
     print(f"🔗 Building training pairs (gold + negatives)...")
     pairs: List[Tuple[str, List[str]]] = []
     kept = 0
-
     for i in tqdm(range(len(train_mentions)), desc="Creating pairs", leave=False):
         m = train_mentions[i]
         gold = m["mesh"]
@@ -643,11 +687,9 @@ def main():
         kept += 1
 
     print(f"  ✅ Created {kept:,} training groups (gold within top-{args.k})")
-    print(f"  ✅ Training recall@{args.k}: {kept / len(train_mentions) * 100:.2f}%")
+    print(f"  ✅ Training recall@{args.k}: {kept / max(1,len(train_mentions)) * 100:.2f}%")
 
-    # ============================================================
-    # STEP 4: Build reranker model and dataset
-    # ============================================================
+    # STEP 4
     print("\n" + "=" * 70)
     print("[STEP 4/7] BUILD RERANKER ADAPTER & DATASET")
     print("=" * 70)
@@ -676,7 +718,7 @@ def main():
         output_dir=args.output_dir,
         learning_rate=args.lr,
         num_train_epochs=args.epochs,
-        per_device_train_batch_size=args.per_device_train_batch_size,
+        per_device_train_batch_size=args.per_device_train_batch_size,  # not used by our batch_sampler, but fine
         per_device_eval_batch_size=args.per_device_eval_batch_size,
         weight_decay=args.weight_decay,
         logging_steps=50,
@@ -685,30 +727,33 @@ def main():
         remove_unused_columns=False,
         report_to=[],
         seed=args.seed,
+        use_mps_device=False,
         use_cpu=True
-
     )
 
-    # ============================================================
-    # STEP 5: Train reranker
-    # ============================================================
+    # STEP 5
     print("\n" + "=" * 70)
     print("[STEP 5/7] TRAIN RERANKER ADAPTER")
     print("=" * 70)
+
+    # ONE WHOLE QUERY GROUP PER BATCH (safest)
+    grouped_sampler = QueryGroupedSampler(train_ds, groups_per_batch=1)
+    collator = QueryGroupedCollator(tok)
 
     trainer = ListwiseAdapterTrainer(
         model=rer_model,
         args=args_hf,
         train_dataset=train_ds,
         tokenizer=tok,
+        grouped_sampler=grouped_sampler,
+        data_collator=collator,
     )
 
     if not args.evaluate_only and args.epochs > 0:
         print(f"🚀 Starting training ({args.epochs} epochs)...")
-        print(f"   Batch size: {args.per_device_train_batch_size}")
-        print(f"   Learning rate: {args.lr}")
-        print(f"   Optimizer: AdamW (weight_decay={args.weight_decay})")
-        print()
+        print(f"   Groups per batch: 1 (one query per batch)")
+        print(f"   Total training groups (queries): {len(pairs)}")
+        print(f"   Total training examples (pairs): {len(train_ds)}")
         trainer.train()
         print(f"\n💾 Saving model to: {args.output_dir}")
         trainer.save_model(args.output_dir)
@@ -717,42 +762,14 @@ def main():
     else:
         print("  ⏭️  Skipping training (evaluate_only or epochs=0)")
 
-    # ============================================================
-    # STEP 6: Evaluate on test set
-    # ============================================================
-    print("\n" + "=" * 70)
-    print("[STEP 6/7] EVALUATE ON TEST SET")
-    print("=" * 70)
+    # EVALUATE on VALIDATION (dev) split
+    run_eval_on_split("train", ds, searcher, tok, rer_model, args, device)
 
-    test_mentions = collect_mentions(ds["test"], "test")
-    test_queries = [to_query(m) for m in tqdm(test_mentions, desc="Building test queries", leave=False)]
+    # EVALUATE on VALIDATION (dev) split
+    run_eval_on_split("validation", ds, searcher, tok, rer_model, args, device)
 
-    # Use searcher for test retrieval
-    print(f"🔍 Retrieving top-{args.k} test candidates using SAPBERTIndexSearcher...")
-    test_search_results = searcher.batch_search(test_queries, k=args.k)
-    test_candidates = extract_candidates_from_search_results(test_search_results)
-
-    # Batched evaluation
-    results = evaluate_reranker(
-        rer_model, tok, test_mentions, test_queries, test_candidates,
-        args.max_length, device, batch_size=args.eval_batch_size
-    )
-
-    # ============================================================
-    # Final Results
-    # ============================================================
-    print("\n" + "=" * 70)
-    print("FINAL EVALUATION RESULTS".center(70))
-    print("=" * 70)
-    print(f"📊 Dataset:                 {results['evaluated_on']}")
-    print(f"🔍 Retrieval Recall@{args.k:>2}:      {results['retrieval_recall@k'] * 100:>6.2f}%  (gold in top-K)")
-    print("-" * 70)
-    print(f"🥇 Reranker Top-1:          {results['rerank_top1'] * 100:>6.2f}%")
-    print(f"🏅 Reranker Top-5:          {results['rerank_top5'] * 100:>6.2f}%")
-    print(f"📈 Mean Reciprocal Rank:    {results['mrr']:>6.4f}")
-    print("=" * 70)
-    print(f"💾 Model saved in: {args.output_dir}")
-    print("=" * 70 + "\n")
+    # EVALUATE on TEST split
+    run_eval_on_split("test", ds, searcher, tok, rer_model, args, device)
 
 
 if __name__ == "__main__":
