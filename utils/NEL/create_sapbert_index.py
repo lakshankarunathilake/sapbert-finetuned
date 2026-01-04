@@ -1,17 +1,22 @@
 #!/usr/bin/env python3
 """
-SAPBERT Index Creator
+SAPBERT Index Creator with Adapter Support
 
-Creates FAISS indexes from Wikidata CSV files using SAPBERT embeddings.
+Creates FAISS indexes from Wikidata CSV files using SAPBERT embeddings with optional adapter support.
 
 Usage:
+    # Without adapter
     python create_sapbert_index.py --csv_path data.csv --output_dir indexes
+
+    # With adapter
+    python create_sapbert_index.py --csv_path data.csv --output_dir indexes --adapter_name my_adapter
 
 Example:
     python create_sapbert_index.py \
         --csv_path wikidata_entities.csv \
         --output_dir ./indexes \
         --index_name biomedical_entities \
+        --adapter_name domain_adapter \
         --index_type IVF \
         --batch_size 32
 """
@@ -27,7 +32,7 @@ import os
 import json
 import argparse
 import time
-from typing import List, Dict
+from typing import List, Dict, Optional
 import logging
 
 # Set up logging
@@ -38,17 +43,25 @@ logger = logging.getLogger(__name__)
 class SAPBERTIndexCreator:
     """
     Utility class for creating SAPBERT embeddings and FAISS indexes
-    from Wikidata CSV files
+    from Wikidata CSV files with optional adapter support
     """
 
-    def __init__(self, model_name: str = "cambridgeltl/SapBERT-from-PubMedBERT-fulltext"):
+    def __init__(self,
+                 model_name: str = "cambridgeltl/SapBERT-from-PubMedBERT-fulltext",
+                 adapter_name: Optional[str] = None,
+                 adapter_path: Optional[str] = None):
         """
         Initialize the index creator
 
         Args:
-            model_name: HuggingFace model name for SAPBERT
+            model_name: HuggingFace model name for SAPBERT (base model)
+            adapter_name: Name of the adapter to load from HuggingFace Hub
+            adapter_path: Local path to adapter weights (alternative to adapter_name)
         """
         self.model_name = model_name
+        self.adapter_name = adapter_name
+        self.adapter_path = adapter_path
+        self.use_adapter = adapter_name is not None or adapter_path is not None
 
         # Mac-specific device selection to avoid MPS issues
         if torch.cuda.is_available():
@@ -71,6 +84,8 @@ class SAPBERTIndexCreator:
         self.embedding_dim = 768
 
         logger.info(f"Initialized SAPBERTIndexCreator with device: {self.device}")
+        if self.use_adapter:
+            logger.info(f"Adapter mode enabled: {adapter_name or adapter_path}")
 
         # Set multiprocessing method for Mac compatibility
         import multiprocessing as mp
@@ -81,12 +96,51 @@ class SAPBERTIndexCreator:
             pass  # Method already set
 
     def _load_model(self):
-        """Load SAPBERT model and tokenizer if not already loaded"""
+        """Load SAPBERT model and tokenizer with optional adapter"""
         if self.model is None or self.tokenizer is None:
             logger.info(f"Loading SAPBERT model: {self.model_name}")
+
             try:
+                # Load tokenizer
                 self.tokenizer = AutoTokenizer.from_pretrained(self.model_name)
-                self.model = AutoModel.from_pretrained(self.model_name)
+
+                # Load model with adapter support if needed
+                if self.use_adapter:
+                    try:
+                        from adapters import AutoAdapterModel
+                        logger.info("Loading model with adapters library...")
+
+                        # Load base model with adapter support
+                        self.model = AutoAdapterModel.from_pretrained(self.model_name)
+
+                        # Load adapter
+                        if self.adapter_path:
+                            logger.info(f"Loading adapter from local path: {self.adapter_path}")
+                            adapter_name = self.model.load_adapter(self.adapter_path, source="local")
+                        else:
+                            logger.info(f"Loading adapter from Hub: {self.adapter_name}")
+                            adapter_name = self.model.load_adapter(self.adapter_name)
+
+                        # Activate the adapter
+                        self.model.set_active_adapters(adapter_name)
+                        logger.info(f"Adapter '{adapter_name}' loaded and activated")
+
+                        # disable the headers
+                        self.model.active_head = None
+                        logger.info(f"Adapter '{adapter_name}' head disabled")
+
+                    except ImportError:
+                        logger.error("adapters library not found. Install with: pip install adapters")
+                        raise ImportError(
+                            "The 'adapters' library is required for adapter support. "
+                            "Install it with: pip install adapters"
+                        )
+                    except Exception as e:
+                        logger.error(f"Failed to load adapter: {e}")
+                        raise
+                else:
+                    # Load standard model without adapters
+                    self.model = AutoModel.from_pretrained(self.model_name)
 
                 # Move to device with error handling
                 try:
@@ -150,10 +204,11 @@ class SAPBERTIndexCreator:
         embeddings = []
 
         # Reduce batch size on Mac to avoid memory issues
-        import platform
-        if platform.system() == "Darwin":  # macOS
-            batch_size = min(batch_size, 8)
-            logger.info(f"Running on macOS, reducing batch size to {batch_size}")
+        # TODO: Activate this if needed
+        # import platform
+        # if platform.system() == "Darwin":  # macOS
+        #     batch_size = min(batch_size, 8)
+        #     logger.info(f"Running on macOS, reducing batch size to {batch_size}")
 
         logger.info(f"Using max_length={max_length} for tokenization")
 
@@ -161,7 +216,7 @@ class SAPBERTIndexCreator:
             batch_texts = texts[i:i + batch_size]
 
             try:
-                # Use simple, efficient tokenization - don't over-complicate
+                # Use simple, efficient tokenization
                 toks = self.tokenizer.batch_encode_plus(
                     batch_texts,
                     padding="max_length",
@@ -194,7 +249,7 @@ class SAPBERTIndexCreator:
                         batch_embeddings = outputs.last_hidden_state[:, 0, :].cpu().numpy()
 
                         # Check for problematic embeddings in first few batches
-                        if i < 3:  # Only check first few batches to avoid spam
+                        if i < 3:
                             for j, emb in enumerate(batch_embeddings):
                                 norm = np.linalg.norm(emb)
                                 if norm < 1e-6:
@@ -250,18 +305,15 @@ class SAPBERTIndexCreator:
         faiss.normalize_L2(embeddings)
 
         if index_type == "Flat":
-            # Exact search using inner product (cosine similarity)
             logger.info("Creating Flat index (exact search)...")
             index = faiss.IndexFlatIP(self.embedding_dim)
 
         elif index_type == "IVF":
-            # Approximate search using IVF
             nlist = min(int(np.sqrt(n_embeddings)), 1000)
             logger.info(f"Creating IVF index with {nlist} clusters...")
             quantizer = faiss.IndexFlatIP(self.embedding_dim)
             index = faiss.IndexIVFFlat(quantizer, self.embedding_dim, nlist)
 
-            # Train the index
             logger.info("Training IVF index (this may take a few minutes)...")
             start_time = time.time()
             index.train(embeddings.astype(np.float32))
@@ -269,7 +321,6 @@ class SAPBERTIndexCreator:
             logger.info(f"IVF training completed in {training_time:.1f} seconds")
 
         elif index_type == "HNSW":
-            # Hierarchical Navigable Small World
             M = 32
             logger.info(f"Creating HNSW index with M={M} connections...")
             logger.info("Note: HNSW construction can be slow but provides very fast search")
@@ -285,8 +336,7 @@ class SAPBERTIndexCreator:
         start_time = time.time()
 
         if index_type == "HNSW" and n_embeddings > 1000:
-            # For HNSW with many embeddings, add in chunks to show progress
-            chunk_size = max(100, n_embeddings // 20)  # 20 progress updates
+            chunk_size = max(100, n_embeddings // 20)
             logger.info(f"Adding {n_embeddings:,} embeddings in chunks of {chunk_size:,}")
 
             for i in tqdm(range(0, n_embeddings, chunk_size), desc="Building HNSW index"):
@@ -294,7 +344,6 @@ class SAPBERTIndexCreator:
                 chunk = embeddings[i:end_idx].astype(np.float32)
                 index.add(chunk)
 
-                # Log progress periodically
                 if (i // chunk_size) % 5 == 0:
                     elapsed = time.time() - start_time
                     progress = (i + chunk_size) / n_embeddings
@@ -302,7 +351,6 @@ class SAPBERTIndexCreator:
                     remaining = estimated_total - elapsed
                     logger.info(f"Progress: {progress * 100:.1f}% - ETA: {remaining / 60:.1f} minutes")
         else:
-            # For other index types or smaller datasets, add all at once
             if n_embeddings > 10000:
                 logger.info(f"Adding {n_embeddings:,} embeddings (this may take several minutes)...")
             index.add(embeddings.astype(np.float32))
@@ -312,7 +360,6 @@ class SAPBERTIndexCreator:
             f"Index construction completed in {construction_time:.1f} seconds ({construction_time / 60:.1f} minutes)")
         logger.info(f"Built {index_type} index with {index.ntotal:,} embeddings")
 
-        # Log index statistics
         if hasattr(index, 'is_trained'):
             logger.info(f"Index is_trained: {index.is_trained}")
 
@@ -349,6 +396,7 @@ class SAPBERTIndexCreator:
             index_name: Name for the index files
             index_type: Type of FAISS index ("Flat", "IVF", "HNSW")
             batch_size: Batch size for embedding generation
+            max_length: Maximum sequence length for tokenization
 
         Returns:
             Path to the saved index directory
@@ -378,32 +426,27 @@ class SAPBERTIndexCreator:
 
         logger.info("Processing aliases...")
         for idx, row in tqdm(df.iterrows(), total=len(df), desc="Processing rows"):
-            entity_id = str(row[id_column]).strip()  # Convert to string and trim
+            entity_id = str(row[id_column]).strip()
             aliases_str = str(row[aliases_column]) if not pd.isna(row[aliases_column]) else ""
 
-            # Skip if ID is empty or NaN
             if not entity_id or entity_id.lower() in ['nan', 'none', '']:
                 continue
 
-            # Preprocess aliases
             aliases = self._preprocess_aliases(aliases_str, entity_id)
 
-            # Skip if no valid aliases
             if not aliases:
                 continue
 
             # Create separate index entries for each alias
             for alias in aliases:
-                # Each alias gets its own embedding for better exact matching
                 all_texts.append(alias)
 
-                # Store metadata for each alias entry
                 processed_data.append({
                     'entity_id': entity_id,
-                    'primary_alias': alias,  # The specific alias for this entry
-                    'all_aliases': aliases,  # All aliases for this entity
+                    'primary_alias': alias,
+                    'all_aliases': aliases,
                     'original_aliases': aliases_str,
-                    'processed_text': alias,  # Just this alias for embedding
+                    'processed_text': alias,
                     'index_id': len(processed_data)
                 })
 
@@ -430,11 +473,14 @@ class SAPBERTIndexCreator:
         config = {
             'index_type': index_type,
             'model_name': self.model_name,
+            'adapter_name': self.adapter_name,
+            'adapter_path': self.adapter_path,
+            'use_adapter': self.use_adapter,
             'embedding_dim': self.embedding_dim,
             'num_entities': len(processed_data),
             'created_at': time.strftime('%Y-%m-%d %H:%M:%S'),
             'processing_time_minutes': (time.time() - start_time) / 60,
-            'max_length': max_length,  # <--- ADD THIS LINE
+            'max_length': max_length,
             'source_columns': {
                 'id_column': id_column,
                 'aliases_column': aliases_column
@@ -459,36 +505,36 @@ class SAPBERTIndexCreator:
 def parse_arguments():
     """Parse command line arguments"""
     parser = argparse.ArgumentParser(
-        description="Create SAPBERT FAISS index from Wikidata CSV file",
+        description="Create SAPBERT FAISS index from Wikidata CSV file with optional adapter support",
         formatter_class=argparse.RawDescriptionHelpFormatter,
         epilog="""
 Examples:
-  # Basic usage with defaults
-  python create_sapbert_index.py
+  # Basic usage without adapter
+  python create_sapbert_index.py --csv_path data.csv
 
-  # Custom parameters
+  # With adapter from HuggingFace Hub
+  python create_sapbert_index.py \
+      --csv_path data.csv \
+      --adapter_name username/my-adapter
+
+  # With local adapter
+  python create_sapbert_index.py \
+      --csv_path data.csv \
+      --adapter_path ./my_adapter
+
+  # Custom parameters with adapter
   python create_sapbert_index.py \
       --csv_path my_data.csv \
       --output_dir ./my_indexes \
       --index_name biomedical_entities \
-      --index_type Flat \
+      --adapter_name domain_adapter \
+      --index_type IVF \
       --batch_size 32
 
-  # High-accuracy index for small dataset
-  python create_sapbert_index.py \
-      --csv_path small_data.csv \
-      --index_type Flat
-
-  # Fast index for large dataset
-  python create_sapbert_index.py \
-      --csv_path large_data.csv \
-      --index_type HNSW \
-      --batch_size 64
-
 Index Types (Accuracy vs Speed):
-  Flat: Maximum accuracy (100% exact), slower search - use for small datasets or when perfect accuracy needed
-  IVF:  High accuracy (~95-99%), good search speed - RECOMMENDED for most use cases
-  HNSW: Good accuracy (~90-95%), fastest search - use for very large datasets when speed is critical
+  Flat: Maximum accuracy (100% exact), slower search
+  IVF:  High accuracy (~95-99%), good search speed - RECOMMENDED
+  HNSW: Good accuracy (~90-95%), fastest search
         """
     )
 
@@ -496,21 +542,21 @@ Index Types (Accuracy vs Speed):
         '--csv_path',
         type=str,
         default='data/entities.csv',
-        help='Path to CSV file (first column = ID, second column = aliases with ||) (default: data/entities.csv)'
+        help='Path to CSV file (first column = ID, second column = aliases with ||)'
     )
 
     parser.add_argument(
         '--output_dir',
         type=str,
         default='./indexes',
-        help='Directory to save index files (default: ./indexes)'
+        help='Directory to save index files'
     )
 
     parser.add_argument(
         '--index_name',
         type=str,
         default='entities_index',
-        help='Name for index files (default: entities_index)'
+        help='Name for index files'
     )
 
     parser.add_argument(
@@ -518,21 +564,35 @@ Index Types (Accuracy vs Speed):
         type=str,
         choices=['Flat', 'IVF', 'HNSW'],
         default='IVF',
-        help='FAISS index type - Flat: best accuracy, IVF: balanced (recommended), HNSW: fastest search (default: IVF)'
+        help='FAISS index type'
     )
 
     parser.add_argument(
         '--batch_size',
         type=int,
         default=16,
-        help='Batch size for embedding generation (default: 16)'
+        help='Batch size for embedding generation'
     )
 
     parser.add_argument(
         '--model_name',
         type=str,
         default='cambridgeltl/SapBERT-from-PubMedBERT-fulltext',
-        help='SAPBERT model name (default: cambridgeltl/SapBERT-from-PubMedBERT-fulltext)'
+        help='SAPBERT base model name'
+    )
+
+    parser.add_argument(
+        '--adapter_name',
+        type=str,
+        default=None,
+        help='Adapter name from HuggingFace Hub (e.g., username/adapter-name)'
+    )
+
+    parser.add_argument(
+        '--adapter_path',
+        type=str,
+        default=None,
+        help='Local path to adapter weights (alternative to --adapter_name)'
     )
 
     parser.add_argument(
@@ -545,7 +605,7 @@ Index Types (Accuracy vs Speed):
         '--max_length',
         type=int,
         default=16,
-        help='Maximum sequence length for tokenization (default: 16, good for entity names)'
+        help='Maximum sequence length for tokenization'
     )
 
     parser.add_argument(
@@ -562,9 +622,8 @@ def validate_csv_file(csv_path: str):
     if not os.path.exists(csv_path):
         raise FileNotFoundError(f"CSV file not found: {csv_path}")
 
-    import pandas as pd
     try:
-        df_sample = pd.read_csv(csv_path, nrows=5)  # Read more rows for better validation
+        df_sample = pd.read_csv(csv_path, nrows=5)
 
         if len(df_sample.columns) < 2:
             raise ValueError(
@@ -573,10 +632,6 @@ def validate_csv_file(csv_path: str):
         id_column = df_sample.columns[0]
         aliases_column = df_sample.columns[1]
 
-        # Check for empty ID column
-        empty_ids = df_sample[id_column].isna().sum()
-
-        # Get row count
         row_count = len(pd.read_csv(csv_path))
 
         logger.info(f"✓ CSV file validated: {csv_path}")
@@ -585,9 +640,8 @@ def validate_csv_file(csv_path: str):
         logger.info(f"✓ Total rows: {row_count:,}")
         logger.info(f"✓ Sample data preview:")
 
-        # Show sample data
         for i, (_, row) in enumerate(df_sample.iterrows()):
-            if i >= 3:  # Show max 3 examples
+            if i >= 3:
                 break
             entity_id = str(row[id_column]).strip()
             aliases = str(row[aliases_column]) if not pd.isna(row[aliases_column]) else ""
@@ -606,18 +660,20 @@ def main():
     if args.verbose:
         logging.getLogger().setLevel(logging.DEBUG)
 
+    # Validate adapter arguments
+    if args.adapter_name and args.adapter_path:
+        logger.error("Cannot specify both --adapter_name and --adapter_path. Choose one.")
+        return
+
     # Mac-specific environment setup
     import platform
     if platform.system() == "Darwin":
-        import os
-        # Disable OpenMP on Mac to avoid conflicts
         os.environ["OMP_NUM_THREADS"] = "1"
-        # Set PyTorch thread settings for Mac
         torch.set_num_threads(1)
         logger.info("Applied macOS-specific optimizations")
 
     print("=" * 60)
-    print("SAPBERT FAISS Index Creator")
+    print("SAPBERT FAISS Index Creator with Adapter Support")
     print("=" * 60)
 
     try:
@@ -630,7 +686,7 @@ def main():
             return
 
         # Estimate processing time
-        estimated_minutes = max(1, row_count // 500)  # More conservative estimate for Mac
+        estimated_minutes = max(1, row_count // 500)
 
         # Display configuration
         print(f"\n⚙️  Configuration:")
@@ -638,8 +694,16 @@ def main():
         print(f"   Output Directory: {args.output_dir}")
         print(f"   Index Name: {args.index_name}")
         print(f"   Index Type: {args.index_type}")
+        print(f"   Base Model: {args.model_name}")
+
+        if args.adapter_name:
+            print(f"   Adapter (Hub): {args.adapter_name}")
+        elif args.adapter_path:
+            print(f"   Adapter (Local): {args.adapter_path}")
+        else:
+            print(f"   Adapter: None (using base model only)")
+
         print(f"   Batch Size: {args.batch_size}")
-        print(f"   Model: {args.model_name}")
         print(f"   Rows to Process: {row_count:,}")
         print(f"   Estimated Time: ~{estimated_minutes} minutes")
 
@@ -647,7 +711,7 @@ def main():
             print(f"   Platform: macOS (optimized settings applied)")
 
         # Confirm for large datasets
-        if row_count > 10000:  # Lower threshold for Mac
+        if row_count > 10000:
             response = input(f"\n⚠️  Large dataset detected ({row_count:,} rows). Continue? [y/N]: ")
             if response.lower() != 'y':
                 print("Operation cancelled.")
@@ -655,7 +719,11 @@ def main():
 
         # Create index
         print(f"\n🚀 Creating index...")
-        creator = SAPBERTIndexCreator(model_name=args.model_name)
+        creator = SAPBERTIndexCreator(
+            model_name=args.model_name,
+            adapter_name=args.adapter_name,
+            adapter_path=args.adapter_path
+        )
 
         index_path = creator.create_index_from_csv(
             csv_path=args.csv_path,
@@ -675,7 +743,7 @@ def main():
         index_files = list(Path(args.output_dir).glob(f"{args.index_name}*"))
         print(f"\n📁 Created Files:")
         for file_path in sorted(index_files):
-            file_size = file_path.stat().st_size / (1024 * 1024)  # MB
+            file_size = file_path.stat().st_size / (1024 * 1024)
             print(f"   {file_path.name} ({file_size:.1f} MB)")
 
         # Show usage example
