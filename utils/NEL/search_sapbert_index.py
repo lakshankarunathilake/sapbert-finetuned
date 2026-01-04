@@ -92,6 +92,16 @@ class SAPBERTIndexSearcher:
         except RuntimeError:
             pass
 
+    # ✅ FIX 1: metadata compatibility helper
+    def _iter_metadata(self):
+        """Iterate over metadata entries regardless of list/dict format."""
+        if isinstance(self.metadata, dict):
+            return self.metadata.values()
+        elif isinstance(self.metadata, list):
+            return self.metadata
+        else:
+            return []
+
     def _resolve_adapter_settings(self):
         """
         Resolve final adapter settings based on:
@@ -163,8 +173,17 @@ class SAPBERTIndexSearcher:
                 self.model.set_active_adapters(active_name)
                 logger.info(f"Adapter '{active_name}' activated")
 
-                # Disable the heads if present
-                self.model.active_head = None
+                # ✅ FIX 2: Disable heads safely (version-safe)
+                if hasattr(self.model, "set_active_head"):
+                    try:
+                        self.model.set_active_head(None)
+                    except Exception:
+                        pass
+                elif hasattr(self.model, "active_head"):
+                    try:
+                        self.model.active_head = None
+                    except Exception:
+                        pass
 
             except Exception as e:
                 logger.error(f"Failed to load/activate adapter: {e}")
@@ -199,6 +218,21 @@ class SAPBERTIndexSearcher:
                 self.index_config = json.load(f)
 
             self.embedding_dim = self.index_config.get('embedding_dim', 768)
+
+            # ✅ FIX 3: dimension safety
+            if hasattr(self.index, "d") and self.index.d != self.embedding_dim:
+                logger.warning(
+                    f"Index dimension ({self.index.d}) != config embedding_dim ({self.embedding_dim}). "
+                    f"Using index.d={self.index.d}"
+                )
+                self.embedding_dim = self.index.d
+
+            # ✅ FIX 4: warn if index not normalized (important for cosine similarity)
+            if not self.index_config.get("normalized", False):
+                logger.warning(
+                    "Index config does not confirm embeddings are normalized. "
+                    "Cosine similarity via inner product assumes normalized embeddings."
+                )
 
             # Update model name from config if not specified
             if self.model_name is None:
@@ -273,7 +307,13 @@ class SAPBERTIndexSearcher:
         for score, idx in zip(scores[0], indices[0]):
             if idx == -1:
                 continue
-            result = self.metadata[idx].copy()
+
+            # ✅ FIX 5: support both list/dict metadata formats safely
+            if isinstance(self.metadata, dict):
+                result = self.metadata[idx].copy()
+            else:
+                result = self.metadata[idx].copy()
+
             eid = result['entity_id']
             if eid in seen_entities:
                 continue
@@ -294,12 +334,14 @@ class SAPBERTIndexSearcher:
     def batch_search(self, queries: List[str], k: int = 10) -> List[List[Dict]]:
         return [self.search(q, k) for q in tqdm(queries, desc="Processing queries")]
 
+    # ✅ FIX 6: get_entity_by_id works for both list/dict and avoids mutating metadata
     def get_entity_by_id(self, entity_id: str) -> Optional[Dict]:
-        for md in self.metadata.values():
-            if md['entity_id'] == entity_id:
-                if 'all_aliases' in md:
-                    md['aliases'] = md['all_aliases']
-                return md
+        for md in self._iter_metadata():
+            if md.get('entity_id') == entity_id:
+                out = md.copy()
+                if 'all_aliases' in out:
+                    out['aliases'] = out['all_aliases']
+                return out
         return None
 
     def get_index_stats(self) -> Dict:
@@ -318,6 +360,15 @@ class SAPBERTIndexSearcher:
             "adapter_name": self.adapter_name,
             "adapter_path": self.adapter_path,
         }
+
+    # ✅ FIX 7: move get_stats into class (was previously outside and unusable)
+    def get_stats(self) -> Dict:
+        """
+        Backwards-compatible alias for get_index_stats().
+        Returns keys used by downstream code:
+          num_entities, index_type, model_name, use_adapter, adapter_name, adapter_path, ...
+        """
+        return self.get_index_stats()
 
     def get_similar_entities(self, entity_id: str, k: int = 10) -> List[Dict]:
         ent = self.get_entity_by_id(entity_id)
@@ -387,7 +438,6 @@ Examples:
 
     parser.add_argument('--export', type=str, help='Export results to JSON file')
 
-    # NEW: adapter overrides (mutually exclusive)
     parser.add_argument('--adapter_name', type=str, default=None,
                         help='Adapter name from HuggingFace Hub (overrides index config)')
     parser.add_argument('--adapter_path', type=str, default=None,
@@ -503,14 +553,6 @@ def stats_mode(searcher, args):
     print(f"Adapter Path: {stats['adapter_path']}")
     return stats
 
-def get_stats(self) -> Dict:
-    """
-    Backwards-compatible alias for get_index_stats().
-    Returns keys used by downstream code:
-      num_entities, index_type, model_name, use_adapter, adapter_name, adapter_path, ...
-    """
-    return self.get_index_stats()
-
 
 def main():
     args = parse_arguments()
@@ -523,7 +565,6 @@ def main():
     print("=" * 60)
 
     try:
-        # Initialize with potential overrides
         searcher = SAPBERTIndexSearcher(
             adapter_name=args.adapter_name,
             adapter_path=args.adapter_path

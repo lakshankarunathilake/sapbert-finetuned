@@ -125,9 +125,19 @@ class SAPBERTIndexCreator:
                         self.model.set_active_adapters(adapter_name)
                         logger.info(f"Adapter '{adapter_name}' loaded and activated")
 
-                        # disable the headers
-                        self.model.active_head = None
-                        logger.info(f"Adapter '{adapter_name}' head disabled")
+                        # ✅ FIX 1: disable heads safely (version-safe)
+                        if hasattr(self.model, "set_active_head"):
+                            try:
+                                self.model.set_active_head(None)
+                            except Exception:
+                                pass
+                        elif hasattr(self.model, "active_head"):
+                            try:
+                                self.model.active_head = None
+                            except Exception:
+                                pass
+
+                        logger.info(f"Adapter '{adapter_name}' head disabled (if present)")
 
                     except ImportError:
                         logger.error("adapters library not found. Install with: pip install adapters")
@@ -203,20 +213,12 @@ class SAPBERTIndexCreator:
         self._load_model()
         embeddings = []
 
-        # Reduce batch size on Mac to avoid memory issues
-        # TODO: Activate this if needed
-        # import platform
-        # if platform.system() == "Darwin":  # macOS
-        #     batch_size = min(batch_size, 8)
-        #     logger.info(f"Running on macOS, reducing batch size to {batch_size}")
-
         logger.info(f"Using max_length={max_length} for tokenization")
 
         for i in tqdm(range(0, len(texts), batch_size), desc="Generating embeddings"):
             batch_texts = texts[i:i + batch_size]
 
             try:
-                # Use simple, efficient tokenization
                 toks = self.tokenizer.batch_encode_plus(
                     batch_texts,
                     padding="max_length",
@@ -226,13 +228,11 @@ class SAPBERTIndexCreator:
                     add_special_tokens=True
                 )
 
-                # Log tokenization info for debugging (first batch only)
                 if i == 0:
                     logger.info(f"Tokenization - Sequence length: {toks['input_ids'].shape[1]}")
                     logger.info(f"Sample text: '{batch_texts[0]}'")
                     logger.info(f"Sample tokens: {toks['input_ids'][0].tolist()}")
 
-                # Move inputs to device safely
                 try:
                     toks_device = {k: v.to(self.device) for k, v in toks.items()}
                 except Exception as e:
@@ -241,14 +241,11 @@ class SAPBERTIndexCreator:
                     self.model.to(self.device)
                     toks_device = {k: v.to(self.device) for k, v in toks.items()}
 
-                # Generate embeddings with memory management
                 with torch.no_grad():
                     try:
                         outputs = self.model(**toks_device)
-                        # Use [CLS] token embedding (first token)
                         batch_embeddings = outputs.last_hidden_state[:, 0, :].cpu().numpy()
 
-                        # Check for problematic embeddings in first few batches
                         if i < 3:
                             for j, emb in enumerate(batch_embeddings):
                                 norm = np.linalg.norm(emb)
@@ -260,14 +257,12 @@ class SAPBERTIndexCreator:
 
                         embeddings.extend(batch_embeddings)
 
-                        # Clear GPU cache if using CUDA/MPS
                         if self.device.type in ['cuda', 'mps']:
                             torch.cuda.empty_cache() if self.device.type == 'cuda' else None
 
                     except RuntimeError as e:
                         if "out of memory" in str(e).lower():
                             logger.warning(f"Out of memory, processing individually")
-                            # Process one by one as fallback
                             for text in batch_texts:
                                 single_toks = self.tokenizer.batch_encode_plus(
                                     [text],
@@ -300,7 +295,6 @@ class SAPBERTIndexCreator:
         logger.info(f"Building {index_type} index with {n_embeddings:,} embeddings...")
         logger.info(f"Embedding dimension: {self.embedding_dim}")
 
-        # Normalize embeddings for cosine similarity
         logger.info("Normalizing embeddings for cosine similarity...")
         faiss.normalize_L2(embeddings)
 
@@ -312,7 +306,9 @@ class SAPBERTIndexCreator:
             nlist = min(int(np.sqrt(n_embeddings)), 1000)
             logger.info(f"Creating IVF index with {nlist} clusters...")
             quantizer = faiss.IndexFlatIP(self.embedding_dim)
-            index = faiss.IndexIVFFlat(quantizer, self.embedding_dim, nlist)
+
+            # ✅ FIX 2: force inner product metric explicitly
+            index = faiss.IndexIVFFlat(quantizer, self.embedding_dim, nlist, faiss.METRIC_INNER_PRODUCT)
 
             logger.info("Training IVF index (this may take a few minutes)...")
             start_time = time.time()
@@ -331,7 +327,6 @@ class SAPBERTIndexCreator:
         else:
             raise ValueError(f"Unsupported index type: {index_type}")
 
-        # Add embeddings to index with progress tracking
         logger.info("Adding embeddings to index...")
         start_time = time.time()
 
@@ -365,16 +360,13 @@ class SAPBERTIndexCreator:
 
         return index
 
-    def _save_index(self, index, metadata: Dict, index_path: str, config: Dict):
+    def _save_index(self, index, metadata: List[Dict], index_path: str, config: Dict):
         """Save FAISS index, metadata, and configuration to disk"""
-        # Save FAISS index
         faiss.write_index(index, f"{index_path}.faiss")
 
-        # Save metadata
         with open(f"{index_path}_metadata.pkl", 'wb') as f:
             pickle.dump(metadata, f)
 
-        # Save configuration
         with open(f"{index_path}_config.json", 'w') as f:
             json.dump(config, f, indent=2)
 
@@ -387,40 +379,22 @@ class SAPBERTIndexCreator:
                               index_type: str = "IVF",
                               batch_size: int = 16,
                               max_length: int = 16) -> str:
-        """
-        Create FAISS index from CSV file and save to disk
-
-        Args:
-            csv_path: Path to the CSV file (first column = ID, second column = aliases)
-            output_dir: Directory to save the index and metadata
-            index_name: Name for the index files
-            index_type: Type of FAISS index ("Flat", "IVF", "HNSW")
-            batch_size: Batch size for embedding generation
-            max_length: Maximum sequence length for tokenization
-
-        Returns:
-            Path to the saved index directory
-        """
         start_time = time.time()
 
-        # Create output directory
         os.makedirs(output_dir, exist_ok=True)
 
-        # Load and validate CSV
         logger.info(f"Loading CSV from {csv_path}")
         df = pd.read_csv(csv_path)
 
         if len(df.columns) < 2:
             raise ValueError(f"CSV must have at least 2 columns. Found {len(df.columns)} columns: {list(df.columns)}")
 
-        # Use first two columns regardless of their names
         id_column = df.columns[0]
         aliases_column = df.columns[1]
 
         logger.info(f"Using columns: ID='{id_column}', Aliases='{aliases_column}'")
         logger.info(f"Loaded {len(df)} rows")
 
-        # Process data
         processed_data = []
         all_texts = []
 
@@ -433,14 +407,11 @@ class SAPBERTIndexCreator:
                 continue
 
             aliases = self._preprocess_aliases(aliases_str, entity_id)
-
             if not aliases:
                 continue
 
-            # Create separate index entries for each alias
             for alias in aliases:
                 all_texts.append(alias)
-
                 processed_data.append({
                     'entity_id': entity_id,
                     'primary_alias': alias,
@@ -456,19 +427,16 @@ class SAPBERTIndexCreator:
         if len(processed_data) == 0:
             raise ValueError("No valid entries found after processing. Check your CSV format and data.")
 
-        # Generate embeddings
         logger.info("Generating embeddings...")
         embeddings = self._generate_embeddings_batch(all_texts, batch_size, max_length)
         self.embedding_dim = embeddings.shape[1]
 
-        # Build FAISS index
         logger.info(f"Building {index_type} index...")
         index = self._build_faiss_index(embeddings, index_type)
 
-        # Prepare metadata
-        metadata = {i: processed_data[i] for i in range(len(processed_data))}
+        # ✅ FIX 3: metadata should be LIST aligned with FAISS ids
+        metadata = processed_data
 
-        # Save to disk
         index_path = os.path.join(output_dir, index_name)
         config = {
             'index_type': index_type,
@@ -484,12 +452,17 @@ class SAPBERTIndexCreator:
             'source_columns': {
                 'id_column': id_column,
                 'aliases_column': aliases_column
-            }
+            },
+
+            # ✅ FIX 4: record normalization/pooling/metric assumptions
+            'normalized': True,
+            'metric': 'inner_product',
+            'pooling': 'cls',
+            'per_alias_indexing': True,
         }
 
         self._save_index(index, metadata, index_path, config)
 
-        # Save processed data for reference
         processed_df = pd.DataFrame(processed_data)
         processed_df.to_csv(os.path.join(output_dir, f"{index_name}_processed_data.csv"), index=False)
 
@@ -538,81 +511,18 @@ Index Types (Accuracy vs Speed):
         """
     )
 
-    parser.add_argument(
-        '--csv_path',
-        type=str,
-        default='data/entities.csv',
-        help='Path to CSV file (first column = ID, second column = aliases with ||)'
-    )
-
-    parser.add_argument(
-        '--output_dir',
-        type=str,
-        default='./indexes',
-        help='Directory to save index files'
-    )
-
-    parser.add_argument(
-        '--index_name',
-        type=str,
-        default='entities_index',
-        help='Name for index files'
-    )
-
-    parser.add_argument(
-        '--index_type',
-        type=str,
-        choices=['Flat', 'IVF', 'HNSW'],
-        default='IVF',
-        help='FAISS index type'
-    )
-
-    parser.add_argument(
-        '--batch_size',
-        type=int,
-        default=16,
-        help='Batch size for embedding generation'
-    )
-
-    parser.add_argument(
-        '--model_name',
-        type=str,
-        default='cambridgeltl/SapBERT-from-PubMedBERT-fulltext',
-        help='SAPBERT base model name'
-    )
-
-    parser.add_argument(
-        '--adapter_name',
-        type=str,
-        default=None,
-        help='Adapter name from HuggingFace Hub (e.g., username/adapter-name)'
-    )
-
-    parser.add_argument(
-        '--adapter_path',
-        type=str,
-        default=None,
-        help='Local path to adapter weights (alternative to --adapter_name)'
-    )
-
-    parser.add_argument(
-        '--validate_only',
-        action='store_true',
-        help='Only validate CSV file without creating index'
-    )
-
-    parser.add_argument(
-        '--max_length',
-        type=int,
-        default=16,
-        help='Maximum sequence length for tokenization'
-    )
-
-    parser.add_argument(
-        '--verbose',
-        action='store_true',
-        help='Enable verbose logging'
-    )
+    parser.add_argument('--csv_path', type=str, default='data/entities.csv',
+                        help='Path to CSV file (first column = ID, second column = aliases with ||)')
+    parser.add_argument('--output_dir', type=str, default='./indexes', help='Directory to save index files')
+    parser.add_argument('--index_name', type=str, default='entities_index', help='Name for index files')
+    parser.add_argument('--index_type', type=str, choices=['Flat', 'IVF', 'HNSW'], default='IVF', help='FAISS index type')
+    parser.add_argument('--batch_size', type=int, default=16, help='Batch size for embedding generation')
+    parser.add_argument('--model_name', type=str, default='cambridgeltl/SapBERT-from-PubMedBERT-fulltext', help='SAPBERT base model name')
+    parser.add_argument('--adapter_name', type=str, default=None, help='Adapter name from HuggingFace Hub')
+    parser.add_argument('--adapter_path', type=str, default=None, help='Local path to adapter weights')
+    parser.add_argument('--validate_only', action='store_true', help='Only validate CSV file without creating index')
+    parser.add_argument('--max_length', type=int, default=25, help='Maximum sequence length for tokenization')
+    parser.add_argument('--verbose', action='store_true', help='Enable verbose logging')
 
     return parser.parse_args()
 
@@ -624,14 +534,11 @@ def validate_csv_file(csv_path: str):
 
     try:
         df_sample = pd.read_csv(csv_path, nrows=5)
-
         if len(df_sample.columns) < 2:
-            raise ValueError(
-                f"CSV must have at least 2 columns. Found {len(df_sample.columns)} columns: {list(df_sample.columns)}")
+            raise ValueError(f"CSV must have at least 2 columns. Found {len(df_sample.columns)} columns: {list(df_sample.columns)}")
 
         id_column = df_sample.columns[0]
         aliases_column = df_sample.columns[1]
-
         row_count = len(pd.read_csv(csv_path))
 
         logger.info(f"✓ CSV file validated: {csv_path}")
@@ -656,16 +563,13 @@ def validate_csv_file(csv_path: str):
 def main():
     args = parse_arguments()
 
-    # Set logging level
     if args.verbose:
         logging.getLogger().setLevel(logging.DEBUG)
 
-    # Validate adapter arguments
     if args.adapter_name and args.adapter_path:
         logger.error("Cannot specify both --adapter_name and --adapter_path. Choose one.")
         return
 
-    # Mac-specific environment setup
     import platform
     if platform.system() == "Darwin":
         os.environ["OMP_NUM_THREADS"] = "1"
@@ -677,7 +581,6 @@ def main():
     print("=" * 60)
 
     try:
-        # Validate CSV
         logger.info(f"Validating CSV file: {args.csv_path}")
         row_count = validate_csv_file(args.csv_path)
 
@@ -685,10 +588,8 @@ def main():
             print("✅ CSV validation completed successfully!")
             return
 
-        # Estimate processing time
         estimated_minutes = max(1, row_count // 500)
 
-        # Display configuration
         print(f"\n⚙️  Configuration:")
         print(f"   CSV File: {args.csv_path}")
         print(f"   Output Directory: {args.output_dir}")
@@ -710,14 +611,12 @@ def main():
         if platform.system() == "Darwin":
             print(f"   Platform: macOS (optimized settings applied)")
 
-        # Confirm for large datasets
         if row_count > 10000:
             response = input(f"\n⚠️  Large dataset detected ({row_count:,} rows). Continue? [y/N]: ")
             if response.lower() != 'y':
                 print("Operation cancelled.")
                 return
 
-        # Create index
         print(f"\n🚀 Creating index...")
         creator = SAPBERTIndexCreator(
             model_name=args.model_name,
@@ -734,11 +633,9 @@ def main():
             max_length=args.max_length
         )
 
-        # Show success message
         print(f"\n✅ Index creation completed!")
         print(f"   Index saved to: {index_path}")
 
-        # List created files
         from pathlib import Path
         index_files = list(Path(args.output_dir).glob(f"{args.index_name}*"))
         print(f"\n📁 Created Files:")
@@ -746,7 +643,6 @@ def main():
             file_size = file_path.stat().st_size / (1024 * 1024)
             print(f"   {file_path.name} ({file_size:.1f} MB)")
 
-        # Show usage example
         print(f"\n🔍 Next Steps:")
         print(f"Use the search utility to query your index:")
         print(f"python search_sapbert_index.py --index_path {index_path} --query \"your search term\"")
