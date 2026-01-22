@@ -86,11 +86,26 @@ Two modes via `--query_mode`:
 ```bash
 python bc5cdr_rerank_trainer.py \
   --base_model microsoft/BiomedNLP-PubMedBERT-base-uncased-abstract-fulltext \
-  --retriever_adapter hub:AdapterHub/sapbert_retriever \
-  --faiss_index_path /Users/lakshankarunathilake/PycharmProjects/sapbert/utils/NEL/indexes/mesh_adapter \
+  --pubtator_path /Users/lakshankarunathilake/PycharmProjects/sapbert/train/finetune/bc5cdr/CDR_Data/CDR.Corpus.v010516 \
+  --retriever_adapter_path /Users/lakshankarunathilake/Documents/Adapters/UMLS/sapbert-mesh-adapter \
+  --faiss_index_path /Users/lakshankarunathilake/PycharmProjects/sapbert/utils/NEL/indexes/full_mesh_eng_adapter/full_mesh_eng_adapter \
   --rerank_adapter_name link_rerank \
   --output_dir ./out/rerank_link \
-  --k 50 --epochs 2 --per_device_train_batch_size 2 --lr 5e-5 \
+  --k 10 --epochs 2 --per_device_train_batch_size 2 --lr 5e-5 \
+  --query_mode context --context_window 64
+```
+
+### This is with the BC5CDR index with the adapter model
+```bash
+python bc5cdr_rerank_trainer.py \
+  --base_model microsoft/BiomedNLP-PubMedBERT-base-uncased-abstract-fulltext \
+  --pubtator_path /Users/lakshankarunathilake/PycharmProjects/sapbert/train/finetune/bc5cdr/CDR_Data/CDR.Corpus.v010516 \
+  --retriever_adapter_path /Users/lakshankarunathilake/Documents/Adapters/UMLS/sapbert-mesh-adapter \
+  --faiss_index_path /Users/lakshankarunathilake/PycharmProjects/sapbert/utils/NEL/indexes/full_mesh_eng_adapter/full_mesh_eng_adapter \
+  --rerank_adapter_name link_rerank \
+  --output_dir ./out/rerank_link \
+  --category Disease \
+  --k 10 --epochs 5 --per_device_train_batch_size 2 --lr 5e-5 \
   --query_mode context --context_window 64
 ```
 

@@ -3,13 +3,12 @@
 import argparse
 import os
 import glob
-from dataclasses import dataclass
 from typing import Dict, List, Tuple
 import logging
+import random
 
 import torch
 from torch.utils.data import DataLoader
-from torch import nn
 from transformers import AutoTokenizer, TrainingArguments
 from adapters import AutoAdapterModel
 from adapters.trainer import AdapterTrainer
@@ -20,8 +19,6 @@ from pathlib import Path
 
 PROJECT_ROOT = Path(__file__).resolve().parents[2]  # → sapbert/
 sys.path.insert(0, str(PROJECT_ROOT))
-# IMPORTANT: append directories, not files
-# sys.path.append("/Users/lakshankarunathilake/PycharmProjects/sapbert/utils/NEL")
 from utils.NEL.search_sapbert_index import SAPBERTIndexSearcher
 
 try:
@@ -30,9 +27,57 @@ try:
 except Exception:
     HAS_FAISS = False
 
-# Set up logging
+# Logging
 logging.basicConfig(level=logging.INFO, format='%(asctime)s - %(levelname)s - %(message)s')
 logger = logging.getLogger(__name__)
+
+
+# ------------------------
+# Helper Functions
+# ------------------------
+
+def normalize_mesh_id(mesh_id: str) -> set:
+    """
+    Normalize MESH ID by splitting composites and filtering valid IDs
+
+    Args:
+        mesh_id: MESH ID, possibly composite like '184900|C566112'
+
+    Returns:
+        Set of valid MESH IDs (starting with C or D)
+
+    Example:
+        '184900|C566112' -> {'C566112'}
+        'D017490|242300' -> {'D017490'}
+        'C537406|259450' -> {'C537406'}
+    """
+    if not mesh_id:
+        return set()
+
+    # Split by | and filter to only IDs starting with C or D
+    ids = mesh_id.split('|')
+    valid_ids = {id.strip() for id in ids if id.strip() and (id.strip().startswith('C') or id.strip().startswith('D'))}
+    return valid_ids
+
+
+def check_mesh_match(predicted_id: str, gold_id: str) -> bool:
+    """
+    Check if predicted MESH ID matches gold MESH ID
+    Handles composite IDs by checking if any component matches
+    Only considers IDs starting with C or D
+
+    Args:
+        predicted_id: Predicted MESH ID (possibly composite)
+        gold_id: Gold standard MESH ID (possibly composite)
+
+    Returns:
+        True if any valid ID component matches, False otherwise
+    """
+    predicted_set = normalize_mesh_id(predicted_id)
+    gold_set = normalize_mesh_id(gold_id)
+
+    # Check if there's any intersection
+    return len(predicted_set.intersection(gold_set)) > 0
 
 
 # ------------------------
@@ -43,11 +88,8 @@ def parse_args():
     p = argparse.ArgumentParser()
     p.add_argument("--base_model", required=True)
     p.add_argument("--faiss_index_path", required=True, help="Path to FAISS index (without extension)")
-
-    # Dataset options
     p.add_argument("--pubtator_path", required=True, help="Path to directory with PubTator format files (CDR_*.txt)")
 
-    # Retriever adapter override (optional)
     p.add_argument("--retriever_adapter_name", default=None, help="Override adapter name from Hub for retriever")
     p.add_argument("--retriever_adapter_path", default=None, help="Override adapter local path for retriever")
 
@@ -56,15 +98,18 @@ def parse_args():
 
     p.add_argument("--output_dir", default="./out/reranker")
 
-    p.add_argument("--k", type=int, default=50)
+    # NOTE: We enforce k=10 regardless of args for train+eval consistency
+    p.add_argument("--k", type=int, default=10, help="(Ignored) always forced to 10 for this script")
+
     p.add_argument("--max_length", type=int, default=256)
     p.add_argument("--query_mode", choices=["mention", "context"], default="context")
     p.add_argument("--context_window", type=int, default=64)
 
     p.add_argument("--epochs", type=int, default=2)
-    p.add_argument("--per_device_train_batch_size", type=int, default=64, help="Items per batch (candidates). If using grouped sampler, each batch is 1+ whole query groups.")
+    p.add_argument("--per_device_train_batch_size", type=int, default=64)
     p.add_argument("--per_device_eval_batch_size", type=int, default=64)
-    p.add_argument("--eval_batch_size", type=int, default=32, help="Batch size for reranking during evaluation")
+    p.add_argument("--eval_batch_size", type=int, default=32)
+
     p.add_argument("--lr", type=float, default=5e-5)
     p.add_argument("--weight_decay", type=float, default=0.0)
     p.add_argument("--seed", type=int, default=13)
@@ -72,11 +117,12 @@ def parse_args():
     p.add_argument("--evaluate_only", action="store_true")
     p.add_argument("--train_split", default="validation", choices=["train", "validation"],
                    help="Which split to use for training")
+    p.add_argument("--category", type=str, choices=["Disease", "Chemical", "Both"], default="Both", help="Select which category to use: Disease, Chemical, or Both (default: Both)")
     return p.parse_args()
 
 
 # ------------------------
-# PubTator Format Parser
+# PubTator Parser
 # ------------------------
 
 def parse_pubtator_file(filepath: str) -> List[Dict]:
@@ -113,6 +159,7 @@ def parse_pubtator_file(filepath: str) -> List[Dict]:
                     'text': text,
                     'offset': len(current_doc['full_text'])
                 })
+
                 if current_doc['full_text']:
                     current_doc['full_text'] += '\n'
                 current_doc['full_text'] += text
@@ -136,7 +183,6 @@ def parse_pubtator_file(filepath: str) -> List[Dict]:
                                     'end': end,
                                     'type': entity_type,
                                     'mesh': mesh_id,
-                                    'normalized': [{'db_name': 'MESH', 'db_id': mesh_id}]
                                 })
 
         if current_doc and current_doc['entities']:
@@ -191,9 +237,6 @@ def load_bc5cdr(pubtator_path: str) -> Dict:
         ds[split_name] = split_data
         print(f"  ✅ {split_name}: {len(split_data['id'])} documents")
 
-    if 'validation' not in ds and 'train' in ds:
-        print("  ⚠️  No validation set found, creating from train split (10%)")
-
     missing = [s for s in ['train', 'validation', 'test'] if s not in ds]
     if missing:
         raise RuntimeError(f"Missing required splits: {missing}. Available: {list(ds.keys())}")
@@ -201,88 +244,61 @@ def load_bc5cdr(pubtator_path: str) -> Dict:
     return ds
 
 
-def collect_mentions(ds_split, split_name: str = "split") -> List[dict]:
+# ------------------------
+# Mention Collector (preserve offsets)
+# ------------------------
+
+def collect_mentions(ds_split, split_name: str = "split", category: str = "Both") -> List[dict]:
     mentions = []
     print(f"📋 Collecting mentions from {split_name} split...")
 
     n = len(ds_split["id"])
     for idx in tqdm(range(n), desc=f"Processing {split_name}", leave=False):
         ex = {k: ds_split[k][idx] for k in ds_split.keys()}
-
-        passages = ex.get("passages", [])
         entities = ex.get("entities", [])
-        full_text = ex.get("full_text", None)
-
-        # Build document text
-        if full_text:
-            doc_text = full_text
-        else:
-            parts = []
-            for p in passages:
-                t = p.get("text", "") if isinstance(p, dict) else p["text"]
-                if isinstance(t, list):
-                    parts.extend(t)
-                elif isinstance(t, str):
-                    parts.append(t)
-            doc_text = "\n".join(parts) if parts else None
+        doc_text = ex.get("full_text", None)
+        doc_id = ex.get("id", None)
 
         for ent in entities:
-            mesh = None
-            if isinstance(ent, dict) and 'mesh' in ent:
-                mesh = ent['mesh']
-
-            if not mesh and 'normalized' in ent:
-                norm = ent.get("normalized", [])
-                if norm:
-                    for nrm in norm:
-                        if isinstance(nrm, dict) and str(nrm.get("db_name", "")).lower() == "mesh":
-                            mesh = nrm.get("db_id"); break
-                    if mesh is None and norm and isinstance(norm[0], dict):
-                        mesh = norm[0].get("db_id")
-
-            if mesh is None:
-                continue
-
+            mesh = ent.get("mesh")
             text = ent.get("text", "")
-            if isinstance(text, list):
-                text = " ".join(text)
-            if not text:
+            ent_type = ent.get("type", "")
+            if not mesh or not text:
                 continue
-
-            mentions.append({"text": text, "mesh": mesh, "doc_text": doc_text})
+            if category != "Both" and ent_type.lower() != category.lower():
+                continue
+            mentions.append({
+                "text": text,
+                "mesh": mesh,
+                "doc_text": doc_text,
+                "start": ent.get("start", None),
+                "end": ent.get("end", None),
+                "doc_id": doc_id
+            })
 
     return mentions
 
 
+# ------------------------
+# Query Builder (markers ALWAYS)
+# ------------------------
+
 def build_context_query(mention: dict, tokenizer, window_tokens: int) -> str:
-    text = mention.get("text") or ""
-    doc = mention.get("doc_text")
-    if not doc:
-        return text
-    try:
-        start = doc.lower().index(text.lower())
-        end = start + len(text)
-    except ValueError:
-        return text
-    left = doc[:start]; right = doc[end:]
-    lt = tokenizer.tokenize(left)[-window_tokens:]
-    rt = tokenizer.tokenize(right)[:window_tokens]
-    lstr = tokenizer.convert_tokens_to_string(lt).strip()
-    rstr = tokenizer.convert_tokens_to_string(rt).strip()
-    return f"{lstr} [MENTION] {text} [/MENTION] {rstr}".strip()
+    # Return plain mention text WITHOUT markers for retrieval
+    # Adding context or markers breaks retrieval because the index doesn't use them
+    # The reranker will use context, but retrieval must use plain text
+    return mention.get("text", "")
+
+
+def mention_only_query(m: dict) -> str:
+    # Return plain mention text WITHOUT markers for retrieval
+    # The index was built without [MENTION] markers, so adding them breaks retrieval
+    return m['text']
 
 
 # ------------------------
 # Dataset (list-backed)
 # ------------------------
-
-@dataclass
-class RerankExample:
-    input_ids: List[int]
-    attention_mask: List[int]
-    query_id: int
-    label: int  # 1 for gold, 0 for negatives
-
 
 class SimpleDataset:
     def __init__(self, data: List[Dict]):
@@ -293,24 +309,33 @@ class SimpleDataset:
         return self.data[idx]
 
 
-def make_listwise_dataset(tokenizer: AutoTokenizer, pairs: List[Tuple[str, List[str]]], max_length: int) -> SimpleDataset:
+def make_listwise_dataset(tokenizer: AutoTokenizer,
+                          pairs: List[Tuple[str, List[str]]],
+                          max_length: int) -> SimpleDataset:
     features: List[Dict] = []
     print(f"🏗️  Building training dataset from {len(pairs):,} queries...")
+
     for qid, (q, cand_list) in enumerate(tqdm(pairs, desc="Tokenizing pairs")):
         for j, alias in enumerate(cand_list):
-            enc = tokenizer(f"{q} [SEP] {alias}", truncation=True, padding=False, max_length=max_length)
+            enc = tokenizer(
+                f"{q} [SEP] {alias}",
+                truncation=True,
+                padding=False,
+                max_length=max_length
+            )
             features.append({
                 "input_ids": enc["input_ids"],
                 "attention_mask": enc["attention_mask"],
                 "query_id": qid,
-                "label": 1 if j == 0 else 0,
+                "label": 1 if j == 0 else 0,  # gold must be index 0
             })
+
     print(f"  ✅ Created {len(features):,} training examples")
     return SimpleDataset(features)
 
 
 # ------------------------
-# Collator + Sampler that keep whole query groups together
+# Collator + Sampler (keep whole query groups)
 # ------------------------
 
 class QueryGroupedCollator:
@@ -318,7 +343,6 @@ class QueryGroupedCollator:
         self.tokenizer = tokenizer
 
     def __call__(self, items: List[Dict]):
-        # items are dicts for multiple query groups (complete per group)
         input_ids = [it['input_ids'] for it in items]
         attention_mask = [it['attention_mask'] for it in items]
         query_ids = [it['query_id'] for it in items]
@@ -337,18 +361,16 @@ class QueryGroupedCollator:
             'input_ids': torch.tensor(input_ids_padded, dtype=torch.long),
             'attention_mask': torch.tensor(attention_mask_padded, dtype=torch.long),
             'query_id': torch.tensor(query_ids, dtype=torch.long),
-            'labels': torch.tensor(labels, dtype=torch.long),  # use 'labels' to be HF-friendly
+            'labels': torch.tensor(labels, dtype=torch.long),
         }
 
 
 class QueryGroupedSampler:
     """
-    Yields batches of indices that contain whole query groups.
-    By default, we put exactly ONE full group per batch (safest for listwise).
-    If you want more than one group per batch, set groups_per_batch > 1.
+    Yield batches that contain whole query groups.
+    Default: exactly ONE group per batch (best for listwise).
     """
     def __init__(self, dataset: SimpleDataset, groups_per_batch: int = 1):
-        # group indices by query_id
         groups = {}
         for idx, item in enumerate(dataset.data):
             qid = item["query_id"]
@@ -357,8 +379,6 @@ class QueryGroupedSampler:
         self.groups_per_batch = max(1, int(groups_per_batch))
 
     def __iter__(self):
-        # shuffle groups each epoch
-        import random
         random.shuffle(self.group_list)
         batch = []
         count = 0
@@ -373,13 +393,12 @@ class QueryGroupedSampler:
             yield batch
 
     def __len__(self):
-        # approximate number of batches
         from math import ceil
         return ceil(len(self.group_list) / self.groups_per_batch)
 
 
 # ------------------------
-# Custom Trainer that uses our sampler
+# Custom Trainer (Listwise softmax over 10)
 # ------------------------
 
 class ListwiseAdapterTrainer(AdapterTrainer):
@@ -400,19 +419,13 @@ class ListwiseAdapterTrainer(AdapterTrainer):
         )
 
     def compute_loss(self, model, inputs, return_outputs: bool = False, **kwargs):
-        # accept both 'labels' and 'label'
         labels = inputs.pop("labels", inputs.pop("label", None))
-        if labels is None:
-            raise KeyError(f"No label field in inputs. Got keys: {list(inputs.keys())}")
-        if "query_id" not in inputs:
-            raise KeyError(f"'query_id' missing from inputs. Got keys: {list(inputs.keys())}")
-
         qids = inputs.pop("query_id")
         outputs = model(**inputs)
         logits = outputs.logits.squeeze(-1)
 
-        if hasattr(qids, "ndim") and qids.ndim > 1: qids = qids.view(-1)
-        if hasattr(labels, "ndim") and labels.ndim > 1: labels = labels.view(-1)
+        qids = qids.view(-1)
+        labels = labels.view(-1)
 
         loss_terms = []
         for qid in torch.unique(qids):
@@ -420,26 +433,19 @@ class ListwiseAdapterTrainer(AdapterTrainer):
             group_logits = logits[mask]
             group_labels = labels[mask]
 
-            # one positive per group expected
             pos_idx = (group_labels == 1).nonzero(as_tuple=True)[0]
             if pos_idx.numel() != 1:
-                # skip groups without a single positive
                 continue
 
             log_probs = torch.log_softmax(group_logits, dim=0)
             loss_terms.append(-log_probs[pos_idx[0]])
 
-        if loss_terms:
-            loss = torch.stack(loss_terms).mean()
-        else:
-            # return a zero tensor tied to the graph (not a float)
-            loss = logits.sum() * 0.0
-
+        loss = torch.stack(loss_terms).mean() if loss_terms else logits.sum() * 0.0
         return (loss, outputs) if return_outputs else loss
 
 
 # ------------------------
-# Retrieval and evaluation helpers
+# Retrieval helpers
 # ------------------------
 
 def extract_candidates_from_search_results(search_results: List[List[Dict]]) -> List[Tuple[List[str], List[str]]]:
@@ -458,6 +464,10 @@ def extract_candidates_from_search_results(search_results: List[List[Dict]]) -> 
         candidates.append((cand_aliases, cand_ids))
     return candidates
 
+
+# ------------------------
+# Evaluation (Top-10 reranking)
+# ------------------------
 
 def evaluate_reranker(rer_model, tokenizer, test_mentions, test_queries,
                       candidates_per_query: List[Tuple[List[str], List[str]]],
@@ -481,14 +491,18 @@ def evaluate_reranker(rer_model, tokenizer, test_mentions, test_queries,
         for i, m in enumerate(batch_mentions):
             gold = m["mesh"]
             cand_aliases, cand_cids = batch_candidates[i]
-            if gold not in cand_cids:
+
+            # Use check_mesh_match for composite IDs instead of simple 'in' check
+            gold_found = any(check_mesh_match(cand_id, gold) for cand_id in cand_cids)
+            if not gold_found:
                 continue
 
             metrics['retrieval_recall'] += 1
             metrics['counted'] += 1
-            query_text = batch_queries[i]
 
+            query_text = batch_queries[i]
             pairs = [f"{query_text} [SEP] {a}" for a in cand_aliases]
+
             start_idx = len(batch_pairs)
             batch_pairs.extend(pairs)
             end_idx = len(batch_pairs)
@@ -504,7 +518,9 @@ def evaluate_reranker(rer_model, tokenizer, test_mentions, test_queries,
             continue
 
         inputs = tokenizer(batch_pairs, padding=True, truncation=True,
-                           max_length=max_length, return_tensors="pt").to(device)
+                           max_length=max_length, return_tensors="pt")
+        model_device = next(rer_model.parameters()).device
+        inputs = {k: v.to(model_device) for k, v in inputs.items()}
 
         with torch.no_grad():
             all_logits = rer_model(**inputs).logits.squeeze(-1)
@@ -514,34 +530,36 @@ def evaluate_reranker(rer_model, tokenizer, test_mentions, test_queries,
             ranked_indices = torch.argsort(query_logits, descending=True).cpu().tolist()
             ranked_cids = [meta['cand_cids'][idx] for idx in ranked_indices]
 
-            if ranked_cids[0] == meta['gold']:
+            # Use check_mesh_match for composite ID matching
+            if check_mesh_match(ranked_cids[0], meta['gold']):
                 metrics['top1'] += 1
-            if meta['gold'] in ranked_cids[:5]:
+
+            # Check top-5 with composite ID matching
+            if any(check_mesh_match(cid, meta['gold']) for cid in ranked_cids[:5]):
                 metrics['top5'] += 1
 
-            try:
-                rank = ranked_cids.index(meta['gold']) + 1
-                metrics['mrr'] += 1.0 / rank
-            except ValueError:
-                pass
+            # Calculate MRR with composite ID matching
+            for rank_idx, cid in enumerate(ranked_cids):
+                if check_mesh_match(cid, meta['gold']):
+                    metrics['mrr'] += 1.0 / (rank_idx + 1)
+                    break
 
+        processed = batch_end
         pbar.set_postfix({
-            'recall': f"{metrics['retrieval_recall']}/{batch_end}",
+            'recall': f"{metrics['retrieval_recall']}/{processed}",
             'top1': f"{metrics['top1']}/{metrics['counted']}"
         })
 
     total_mentions = len(test_mentions)
     counted = max(1, metrics['counted'])
 
-    print(f"  ✅ Evaluation complete")
-
     return {
-        'retrieval_recall@k': metrics['retrieval_recall'] / total_mentions,
+        'retrieval_recall@10': metrics['retrieval_recall'] / total_mentions,
         'rerank_top1': metrics['top1'] / counted,
         'rerank_top5': metrics['top5'] / counted,
         'mrr': metrics['mrr'] / counted,
         'evaluated_on': f"{metrics['counted']}/{total_mentions}",
-        'gold_in_topk': metrics['retrieval_recall']
+        'gold_in_top10': metrics['retrieval_recall']
     }
 
 
@@ -551,43 +569,64 @@ def run_eval_on_split(split_name: str,
                       tokenizer: AutoTokenizer,
                       rer_model: AutoAdapterModel,
                       args,
-                      device):
+                      device,
+                      category: str = "Both"):
     if split_name not in ds:
         print(f"\n⚠️  Split '{split_name}' not found. Available: {list(ds.keys())}")
         return None
 
     print("\n" + "=" * 70)
-    print(f"[EVAL] {split_name.upper()} SPLIT".center(70))
+    print(f"[EVAL] {split_name.upper()} SPLIT (TOP-10, CATEGORY: {category.upper()})".center(70))
     print("=" * 70)
 
-    mentions = collect_mentions(ds[split_name], split_name)
+    mentions = collect_mentions(ds[split_name], split_name, category)
     if not mentions:
         print(f"  ⚠️  No mentions in {split_name} split — skipping.")
         return None
 
-    # Build queries (same logic you used for training)
     def to_query(m):
         if args.query_mode == "context":
             return build_context_query(m, searcher.tokenizer, args.context_window)
-        return m["text"]
+        return mention_only_query(m)  # ✅ mention-only always uses markers
 
     queries = [to_query(m) for m in tqdm(mentions, desc=f"Building {split_name} queries", leave=False)]
 
-    print(f"🔍 Retrieving top-{args.k} candidates using SAPBERTIndexSearcher...")
-    search_results = searcher.batch_search(queries, k=args.k)
+    print(f"🔍 Retrieving top-10 candidates using SAPBERTIndexSearcher...")
+    search_results = searcher.batch_search(queries, k=10)
     candidates = extract_candidates_from_search_results(search_results)
+
+    # Diagnostic: Check retrieval recall before reranking
+    gold_in_top10 = 0
+    missing_examples = []
+    for i, m in enumerate(mentions[:min(10, len(mentions))]):  # Check first 10 examples
+        gold = m["mesh"]
+        cand_aliases, cand_cids = candidates[i]
+        # Use check_mesh_match instead of simple 'in' check for composite IDs
+        if any(check_mesh_match(cand_id, gold) for cand_id in cand_cids):
+            gold_in_top10 += 1
+        else:
+            missing_examples.append({
+                'mention': m['text'],
+                'gold': gold,
+                'retrieved': cand_cids[:3] if len(cand_cids) >= 3 else cand_cids
+            })
+
+    print(f"  🔍 Diagnostic: Gold in top-10 for first 10 queries: {gold_in_top10}/10")
+    if missing_examples:
+        print(f"  ⚠️  Sample missing examples:")
+        for ex in missing_examples[:3]:
+            print(f"     Mention: '{ex['mention']}' | Gold: {ex['gold']} | Top-3 Retrieved: {ex['retrieved']}")
 
     results = evaluate_reranker(
         rer_model, tokenizer, mentions, queries, candidates,
         args.max_length, device, batch_size=args.eval_batch_size
     )
 
-    # Pretty print
     print("\n" + "-" * 70)
-    print(f"{split_name.upper()} EVALUATION RESULTS".center(70))
+    print(f"{split_name.upper()} EVALUATION RESULTS (TOP-10, CATEGORY: {category.upper()})".center(70))
     print("-" * 70)
     print(f"📊 Evaluated on:            {results['evaluated_on']}")
-    print(f"🔍 Retrieval Recall@{args.k:>2}:      {results['retrieval_recall@k'] * 100:>6.2f}%")
+    print(f"🔍 Retrieval Recall@10:     {results['retrieval_recall@10'] * 100:>6.2f}%")
     print(f"🥇 Reranker Top-1:          {results['rerank_top1'] * 100:>6.2f}%")
     print(f"🏅 Reranker Top-5:          {results['rerank_top5'] * 100:>6.2f}%")
     print(f"📈 Mean Reciprocal Rank:    {results['mrr']:>6.4f}")
@@ -596,19 +635,33 @@ def run_eval_on_split(split_name: str,
     return results
 
 
+# ------------------------
+# MAIN
+# ------------------------
+
 def main():
     args = parse_args()
+    random.seed(args.seed)
     torch.manual_seed(args.seed)
 
     if not HAS_FAISS:
         raise RuntimeError("FAISS not available. Install with: pip install faiss-cpu (or faiss-gpu)")
 
-    device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
+    # enforce k=10 for everything
+    args.k = 10
+
+    if torch.cuda.is_available():
+        device = torch.device("cuda")
+    elif torch.backends.mps.is_available():
+        device = torch.device("mps")
+    else:
+        device = torch.device("cpu")
     print("\n" + "=" * 70)
-    print("BC5CDR RERANKER TRAINER (using SAPBERTIndexSearcher)".center(70))
+    print("BC5CDR RERANKER TRAINER (Train@10 / Eval@10)".center(70))
     print("=" * 70)
     print(f"🖥️  Device: {device}")
     print(f"🌱 Seed: {args.seed}")
+    print(f"🎯 Candidate set size (k): 10")
     print()
 
     # STEP 1
@@ -616,23 +669,6 @@ def main():
     print("[STEP 1/7] LOAD BC5CDR DATASET")
     print("=" * 70)
     ds = load_bc5cdr(pubtator_path=args.pubtator_path)
-    print(f"  ✅ Train docs: {len(ds['train']['id'])}")
-    print(f"  ✅ Validation docs: {len(ds['validation']['id'])}")
-    print(f"  ✅ Test docs: {len(ds['test']['id'])}")
-
-    def count_entity_rows(ds_split):
-        # Count raw entity rows (before splitting on multiple mesh ids)
-        n_docs = len(ds_split["id"])
-        rows = 0
-        for ents in ds_split["entities"]:
-            rows += len(ents)
-        return n_docs, rows
-
-    n_docs, raw_rows = count_entity_rows(ds["test"])
-    print(f"[DEBUG] Test docs: {n_docs}, raw entity rows: {raw_rows}")
-
-    test_mentions = collect_mentions(ds["test"], "test")
-    print(f"[DEBUG] Mentions built (after splitting by multiple MeSH IDs): {len(test_mentions)}")
 
     # STEP 2
     print("\n" + "=" * 70)
@@ -650,44 +686,62 @@ def main():
     print(f"  ✅ Index type: {stats.get('index_type','?')}")
     print(f"  ✅ Adapter: {'ON' if stats.get('use_adapter') else 'OFF'}")
 
+    # ensure tokenizer ready
+    searcher._load_model()
+
     # STEP 3
     print("\n" + "=" * 70)
     print(f"[STEP 3/7] PREPARE {args.train_split.upper()} SPLIT FOR TRAINING")
     print("=" * 70)
 
-    train_mentions = collect_mentions(ds[args.train_split], args.train_split)
+    train_mentions = collect_mentions(ds[args.train_split], args.train_split, args.category)
     print(f"  ✅ Collected {len(train_mentions):,} mentions")
-
-    searcher._load_model()  # ensure tokenizer available
 
     def to_query(m):
         if args.query_mode == "context":
             return build_context_query(m, searcher.tokenizer, args.context_window)
-        return m["text"]
+        return mention_only_query(m)
 
     print(f"🔄 Building queries (mode: {args.query_mode})...")
     train_queries = [to_query(m) for m in tqdm(train_mentions, desc="Building queries", leave=False)]
 
-    print(f"🔍 Retrieving top-{args.k} candidates using SAPBERTIndexSearcher...")
-    train_search_results = searcher.batch_search(train_queries, k=args.k)  # no 'desc' param
+    print(f"🔍 Retrieving top-10 candidates using SAPBERTIndexSearcher...")
+    train_search_results = searcher.batch_search(train_queries, k=10)
     train_candidates = extract_candidates_from_search_results(train_search_results)
 
-    print(f"🔗 Building training pairs (gold + negatives)...")
+    print(f"🔗 Building training groups (gold + top-9 negatives from top-10)...")
     pairs: List[Tuple[str, List[str]]] = []
     kept = 0
+
     for i in tqdm(range(len(train_mentions)), desc="Creating pairs", leave=False):
         m = train_mentions[i]
         gold = m["mesh"]
-        cand_aliases, cand_cids = train_candidates[i]
-        if gold not in cand_cids:
+        cand_aliases, cand_cids = train_candidates[i]  # already top-10
+
+        # Use check_mesh_match instead of simple 'in' check for composite IDs
+        gold_found = False
+        gold_idx = -1
+        for idx, cand_id in enumerate(cand_cids):
+            if check_mesh_match(cand_id, gold):
+                gold_found = True
+                gold_idx = idx
+                break
+
+        if not gold_found:
             continue
-        gold_alias = cand_aliases[cand_cids.index(gold)]
-        negs = [a for a, c in zip(cand_aliases, cand_cids) if c != gold]
-        pairs.append((train_queries[i], [gold_alias] + negs))
+
+        # gold alias + remaining negatives from within top-10
+        gold_alias = cand_aliases[gold_idx]
+        negs = [a for j, (a, c) in enumerate(zip(cand_aliases, cand_cids)) if j != gold_idx]
+
+        # group size <= 10 always
+        cand_list = [gold_alias] + negs
+        pairs.append((train_queries[i], cand_list))
         kept += 1
 
-    print(f"  ✅ Created {kept:,} training groups (gold within top-{args.k})")
-    print(f"  ✅ Training recall@{args.k}: {kept / max(1,len(train_mentions)) * 100:.2f}%")
+    print(f"  ✅ Created {kept:,} training groups (gold within top-10)")
+    print(f"  ✅ Training recall@10: {kept / max(1,len(train_mentions)) * 100:.2f}%")
+    print(f"  ✅ Group size: 1 positive + {len(pairs[0][1]) - 1 if pairs else 0} negatives (<= 9)")
 
     # STEP 4
     print("\n" + "=" * 70)
@@ -709,7 +763,6 @@ def main():
     rer_model.set_active_adapters([args.rerank_adapter_name])
     rer_model.train_adapter(args.rerank_adapter_name)
     rer_model.to(device)
-    print(f"  ✅ Reranker loaded on {device}")
 
     tok = AutoTokenizer.from_pretrained(args.base_model, use_fast=True)
     train_ds = make_listwise_dataset(tok, pairs, max_length=args.max_length)
@@ -718,17 +771,16 @@ def main():
         output_dir=args.output_dir,
         learning_rate=args.lr,
         num_train_epochs=args.epochs,
-        per_device_train_batch_size=args.per_device_train_batch_size,  # not used by our batch_sampler, but fine
+        per_device_train_batch_size=args.per_device_train_batch_size,
         per_device_eval_batch_size=args.per_device_eval_batch_size,
         weight_decay=args.weight_decay,
         logging_steps=50,
         save_strategy="epoch",
         eval_strategy="no",
         remove_unused_columns=False,
-        report_to=[],
+        report_to=["wandb"],
         seed=args.seed,
-        use_mps_device=False,
-        use_cpu=True
+        use_mps_device=(device.type == "mps")
     )
 
     # STEP 5
@@ -736,7 +788,6 @@ def main():
     print("[STEP 5/7] TRAIN RERANKER ADAPTER")
     print("=" * 70)
 
-    # ONE WHOLE QUERY GROUP PER BATCH (safest)
     grouped_sampler = QueryGroupedSampler(train_ds, groups_per_batch=1)
     collator = QueryGroupedCollator(tok)
 
@@ -751,8 +802,7 @@ def main():
 
     if not args.evaluate_only and args.epochs > 0:
         print(f"🚀 Starting training ({args.epochs} epochs)...")
-        print(f"   Groups per batch: 1 (one query per batch)")
-        print(f"   Total training groups (queries): {len(pairs)}")
+        print(f"   Total training groups: {len(pairs)}")
         print(f"   Total training examples (pairs): {len(train_ds)}")
         trainer.train()
         print(f"\n💾 Saving model to: {args.output_dir}")
@@ -762,14 +812,20 @@ def main():
     else:
         print("  ⏭️  Skipping training (evaluate_only or epochs=0)")
 
-    # EVALUATE on VALIDATION (dev) split
-    run_eval_on_split("train", ds, searcher, tok, rer_model, args, device)
+    # Evaluate on all splits - always show Disease and Chemical separately
+    print("\n" + "=" * 70)
+    print("EVALUATION PHASE".center(70))
+    print("=" * 70)
 
-    # EVALUATE on VALIDATION (dev) split
-    run_eval_on_split("validation", ds, searcher, tok, rer_model, args, device)
-
-    # EVALUATE on TEST split
-    run_eval_on_split("test", ds, searcher, tok, rer_model, args, device)
+    if args.category == "Both":
+        # Evaluate both categories separately
+        for split in ["train", "validation", "test"]:
+            run_eval_on_split(split, ds, searcher, tok, rer_model, args, device, category="Disease")
+            run_eval_on_split(split, ds, searcher, tok, rer_model, args, device, category="Chemical")
+    else:
+        # Evaluate only the selected category
+        for split in ["train", "validation", "test"]:
+            run_eval_on_split(split, ds, searcher, tok, rer_model, args, device, category=args.category)
 
 
 if __name__ == "__main__":
