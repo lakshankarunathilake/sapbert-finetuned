@@ -204,6 +204,8 @@ class SAPBERTIndexSearcher:
         for p in self.model.parameters():
             p.requires_grad = False
 
+        self.model.adapter_summary()
+
         logger.info(f"Model loaded successfully on {self.device} (adapter={'on' if self.use_adapter else 'off'})")
 
     def load_index(self, index_path: str) -> Dict:
@@ -342,6 +344,7 @@ class SAPBERTIndexSearcher:
                 if 'all_aliases' in out:
                     out['aliases'] = out['all_aliases']
                 return out
+        print("entity_id not found in index metadata.")
         return None
 
     def get_index_stats(self) -> Dict:

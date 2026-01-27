@@ -3,12 +3,13 @@ import os
 import glob
 import numpy as np
 import random
-import random
 import pandas as pd
 import json
 from torch.utils.data import Dataset
 import logging
 from tqdm import tqdm
+import torch
+
 LOGGER = logging.getLogger(__name__)
 
 
@@ -324,7 +325,16 @@ class MetricLearningDataset_pairwise(Dataset):
     Candidate Dataset for:
         query_tokens, candidate_tokens, label
     """
-    def __init__(self, path, tokenizer): #d_ratio, s_score_matrix, s_candidate_idxs):
+    def __init__(self, path, tokenizer, category='Both'):
+        # Only load if category matches or category is Both
+        filename = os.path.basename(path).lower()
+        if category != 'Both':
+            if category.lower() not in filename:
+                self.query_ids = []
+                self.query_names = []
+                self.tokenizer = tokenizer
+                self.query_id_2_index_id = {}
+                return
         with open(path, 'r') as f:
             lines = f.readlines()
         self.query_ids = []
@@ -357,8 +367,16 @@ class MetricLearningDataset(Dataset):
     Candidate Dataset for:
         query_tokens, candidate_tokens, label
     """
-    def __init__(self, path, tokenizer): #d_ratio, s_score_matrix, s_candidate_idxs):
+    def __init__(self, path, tokenizer, category='Both'):
         LOGGER.info("Initializing metric learning data set! ...")
+        filename = os.path.basename(path).lower()
+        if category != 'Both':
+            if category.lower() not in filename:
+                self.query_ids = []
+                self.query_names = []
+                self.cui2id = {}
+                self.tokenizer = tokenizer
+                return
         with open(path, 'r') as f:
             lines = f.readlines()
         self.query_ids = []
@@ -367,15 +385,11 @@ class MetricLearningDataset(Dataset):
         for line in lines:
             cui, _ = line.split("||")
             cuis.append(cui)
-
         self.cui2id = {k: v for v, k in enumerate(cuis)}
         for line in lines:
             line = line.rstrip("\n")
             cui, name = line.split("||")
             query_id = self.cui2id[cui]
-            #if query_id.startswith("C"):
-            #    query_id = query_id[1:]
-            #query_id = int(query_id)
             self.query_ids.append(query_id)
             self.query_names.append(name)
         self.tokenizer = tokenizer

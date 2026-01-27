@@ -101,7 +101,7 @@ python bc5cdr_rerank_trainer.py \
   --base_model microsoft/BiomedNLP-PubMedBERT-base-uncased-abstract-fulltext \
   --pubtator_path /Users/lakshankarunathilake/PycharmProjects/sapbert/train/finetune/bc5cdr/CDR_Data/CDR.Corpus.v010516 \
   --retriever_adapter_path /Users/lakshankarunathilake/Documents/Adapters/UMLS/sapbert-mesh-adapter \
-  --faiss_index_path /Users/lakshankarunathilake/PycharmProjects/sapbert/utils/NEL/indexes/full_mesh_eng_adapter/full_mesh_eng_adapter \
+  --faiss_index_path /Users/lakshankarunathilake/PycharmProjects/sapbert/utils/NEL/indexes/sapbert_bcd5cdr_adapter_index/sapbert_bcd5cdr_adapter_index \
   --rerank_adapter_name link_rerank \
   --output_dir ./out/rerank_link \
   --category Disease \
@@ -158,6 +158,8 @@ python bc5cdr_rerank_trainer.py \
 | `--seed`                        | `13`             | RNG seed.                                                                                            |
 | `--evaluate_only`               | flag             | Skip training; only run evaluation steps.                                                            |
 | `--train_split`                 | `validation`     | Which split to use for training: `train` or `validation`.                                            |
+| `--val-dir`                     | `None`           | Directory for validation data (if not using HF datasets).                                            |
+| `--test-dir`                    | `None`           | Directory for test data (if not using HF datasets).                                                  |
 
 ---
 
@@ -226,3 +228,29 @@ This code is provided as‑is, under the same license as this repository (add yo
 ## 🔗 Citation
 
 If you use this code or its results in academic work, please cite the appropriate resources for BC5CDR, FAISS, AdapterHub, and the base model you used.
+
+---
+
+## New Features: Validation and Test Support
+
+- You can now specify validation and test datasets using `--val-dir` and `--test-dir`.
+- The script will evaluate on the validation set at the end of each epoch and save the best model based on the `rerank_top1` metric.
+- After training, the best model is automatically evaluated on the test set.
+
+#### Example with Validation and Test Splits
+```bash
+python bc5cdr_rerank_trainer.py \
+  --base_model microsoft/BiomedNLP-PubMedBERT-base-uncased-abstract-fulltext \
+  --pubtator_path /Users/lakshankarunathilake/PycharmProjects/sapbert/train/finetune/bc5cdr/CDR_Data/CDR.Corpus.v010516 \
+  --retriever_adapter_path /Users/lakshankarunathilake/Documents/Adapters/UMLS/sapbert-mesh-adapter \
+  --faiss_index_path /Users/lakshankarunathilake/PycharmProjects/sapbert/utils/NEL/indexes/sapbert_bcd5cdr_adapter_index/sapbert_bcd5cdr_adapter_index \
+  --rerank_adapter_name link_rerank \
+  --output_dir ./out/rerank_link \
+  --category Disease \
+  --k 10 --epochs 5 --per_device_train_batch_size 2 --lr 5e-5 \
+  --query_mode context --context_window_chars 200
+```
+
+> **Note:**
+> - `--val-dir` and `--test-dir` should point to your validation and test data files, respectively.
+> - The script will print validation metrics after each epoch and test metrics at the end.

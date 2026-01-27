@@ -28,18 +28,18 @@ from train.finetune.bc5cdr_rerank_eval import write_results_to_csv
 
 try:
     import faiss
+
     HAS_FAISS = True
 except Exception:
     HAS_FAISS = False
 
-# FIX: Import wandb for proper run management
 try:
     import wandb
+
     HAS_WANDB = True
 except ImportError:
     HAS_WANDB = False
     print("⚠️  wandb not installed. Install with: pip install wandb")
-
 
 # Logging
 logging.basicConfig(level=logging.INFO, format='%(asctime)s - %(levelname)s - %(message)s')
@@ -59,16 +59,10 @@ def normalize_mesh_id(mesh_id: str) -> set:
 
     Returns:
         Set of valid MESH IDs (starting with C or D)
-
-    Example:
-        '184900|C566112' -> {'C566112'}
-        'D017490|242300' -> {'D017490'}
-        'C537406|259450' -> {'C537406'}
     """
     if not mesh_id:
         return set()
 
-    # Split by | and filter to only IDs starting with C or D
     ids = mesh_id.split('|')
     valid_ids = {id.strip() for id in ids if id.strip() and (id.strip().startswith('C') or id.strip().startswith('D'))}
     return valid_ids
@@ -78,19 +72,9 @@ def check_mesh_match(predicted_id: str, gold_id: str) -> bool:
     """
     Check if predicted MESH ID matches gold MESH ID
     Handles composite IDs by checking if any component matches
-    Only considers IDs starting with C or D
-
-    Args:
-        predicted_id: Predicted MESH ID (possibly composite)
-        gold_id: Gold standard MESH ID (possibly composite)
-
-    Returns:
-        True if any valid ID component matches, False otherwise
     """
     predicted_set = normalize_mesh_id(predicted_id)
     gold_set = normalize_mesh_id(gold_id)
-
-    # Check if there's any intersection
     return len(predicted_set.intersection(gold_set)) > 0
 
 
@@ -112,14 +96,20 @@ def parse_args():
 
     p.add_argument("--output_dir", default="./out/reranker")
 
-    # NOTE: We enforce k=10 regardless of args for train+eval consistency
     p.add_argument("--k", type=int, default=10, help="(Ignored) always forced to 10 for this script")
 
     p.add_argument("--max_length", type=int, default=256)
     p.add_argument("--query_mode", choices=["mention", "context"], default="context")
-    # FIX: Renamed to context_window_chars and increased to reasonable size (~64 tokens ≈ 256 chars)
     p.add_argument("--context_window_chars", type=int, default=256,
                    help="Number of characters to include on each side of mention for context (default: 256)")
+
+    # NEW: Fusion parameters
+    p.add_argument("--use_fusion", action="store_true",
+                   help="Enable score fusion (blend retrieval + reranker scores)")
+    p.add_argument("--fusion_alpha", type=float, default=0.8,
+                   help="Fusion weight for retrieval score (0.8 = 80%% retrieval, 20%% reranker)")
+    p.add_argument("--tune_alpha", action="store_true",
+                   help="Auto-tune fusion_alpha on validation set (tests 0.5, 0.7, 0.8, 0.9, 0.95)")
 
     p.add_argument("--epochs", type=int, default=2)
     p.add_argument("--per_device_train_batch_size", type=int, default=64)
@@ -131,10 +121,10 @@ def parse_args():
     p.add_argument("--seed", type=int, default=13)
 
     p.add_argument("--evaluate_only", action="store_true")
-    # FIX: Changed default from "validation" to "train" to avoid data leakage
     p.add_argument("--train_split", default="train", choices=["train", "validation"],
                    help="Which split to use for training (default: train)")
-    p.add_argument("--category", type=str, choices=["Disease", "Chemical", "Both"], default="Both", help="Select which category to use: Disease, Chemical, or Both (default: Both)")
+    p.add_argument("--category", type=str, choices=["Disease", "Chemical", "Both"], default="Both",
+                   help="Select which category to use: Disease, Chemical, or Both (default: Both)")
     return p.parse_args()
 
 
@@ -177,7 +167,6 @@ def parse_pubtator_file(filepath: str) -> List[Dict]:
                     'offset': len(current_doc['full_text'])
                 })
 
-                # FIX: Use space instead of newline to preserve PubTator offsets
                 if current_doc['full_text']:
                     current_doc['full_text'] += ' '
                 current_doc['full_text'] += text
@@ -263,7 +252,7 @@ def load_bc5cdr(pubtator_path: str) -> Dict:
 
 
 # ------------------------
-# Mention Collector (preserve offsets)
+# Mention Collector
 # ------------------------
 
 def collect_mentions(ds_split, split_name: str = "split", category: str = "Both") -> List[dict]:
@@ -302,65 +291,44 @@ def collect_mentions(ds_split, split_name: str = "split", category: str = "Both"
 # ------------------------
 
 def to_retrieval_query(m: dict) -> str:
-    """
-    Build query for FAISS retrieval (plain text, no markers)
-    The index was built with plain text, so we must match that format
-    """
+    """Build query for FAISS retrieval (plain text, no markers)"""
     return m.get("text", "")
 
 
 def to_rerank_query(m: dict, window_chars: int = 200) -> str:
-    """
-    Build query for reranking with context and markers
-    """
+    """Build query for reranking with context and markers"""
     return build_rerank_query_with_context(m, window_chars=window_chars)
 
 
 def build_rerank_query_with_context(m: dict, window_chars: int = 200) -> str:
     """
     Build a context-aware query for reranking with [MENTION] markers
-
-    Args:
-        m: Mention dictionary containing doc_text, start, end, text
-        window_chars: Number of characters to include on each side of the mention
-
-    Returns:
-        Query string with context and mention markers
     """
     doc = m.get("doc_text") or ""
     start, end = m.get("start"), m.get("end")
     mention = m.get("text", "")
 
     if start is None or end is None or not doc:
-        # fallback: at least mark mention
         return f"[MENTION] {mention} [/MENTION]"
 
-    # If offsets are wrong, fallback gracefully
     if start < 0 or end > len(doc) or start >= end:
         return f"[MENTION] {mention} [/MENTION]"
 
-    # FIX: Use tolerant matching - normalize whitespace for comparison
     slice_ = doc[start:end]
-    # Normalize whitespace for comparison (collapse multiple spaces, strip)
     slice_normalized = " ".join(slice_.split())
     mention_normalized = " ".join(mention.split())
 
-    # If strict match fails, try tolerant match or search nearby
     if slice_ != mention:
         if slice_normalized != mention_normalized:
-            # Try to find mention within ±50 chars of expected position
             search_start = max(0, start - 50)
             search_end = min(len(doc), end + 50)
             search_region = doc[search_start:search_end]
 
-            # Try to find the mention in the search region
             idx = search_region.find(mention)
             if idx != -1:
-                # Found it! Adjust offsets
                 start = search_start + idx
                 end = start + len(mention)
             else:
-                # Can't find it - fallback to mention-only with markers
                 logger.warning(f"Offset mismatch: expected '{slice_}' but got '{mention}' at [{start}:{end}]")
                 return f"[MENTION] {mention} [/MENTION]"
 
@@ -371,7 +339,6 @@ def build_rerank_query_with_context(m: dict, window_chars: int = 200) -> str:
     mid = doc[start:end]
     right_ctx = doc[end:right]
 
-    # clean newlines for stability
     left_ctx = " ".join(left_ctx.split())
     right_ctx = " ".join(right_ctx.split())
     mid = " ".join(mid.split())
@@ -379,30 +346,17 @@ def build_rerank_query_with_context(m: dict, window_chars: int = 200) -> str:
     return f"{left_ctx} [MENTION] {mid} [/MENTION] {right_ctx}"
 
 
-# Deprecated - kept for backward compatibility
-def build_context_query(mention: dict, tokenizer, window_tokens: int) -> str:
-    """
-    Deprecated: Use to_retrieval_query() instead
-    """
-    return to_retrieval_query(mention)
-
-
-def mention_only_query(m: dict) -> str:
-    """
-    Deprecated: Use to_retrieval_query() instead
-    """
-    return to_retrieval_query(m)
-
-
 # ------------------------
-# Dataset (list-backed)
+# Dataset
 # ------------------------
 
 class SimpleDataset:
     def __init__(self, data: List[Dict]):
         self.data = data
+
     def __len__(self):
         return len(self.data)
+
     def __getitem__(self, idx):
         return self.data[idx]
 
@@ -413,7 +367,6 @@ def make_listwise_dataset(tokenizer: AutoTokenizer,
     features: List[Dict] = []
     print(f"🏗️  Building training dataset from {len(pairs):,} queries...")
 
-    # FIX #8: Use tokenizer's separator token instead of hardcoded [SEP]
     sep_token = tokenizer.sep_token if tokenizer.sep_token else "[SEP]"
 
     for qid, (q, cand_list) in enumerate(tqdm(pairs, desc="Tokenizing pairs")):
@@ -428,7 +381,7 @@ def make_listwise_dataset(tokenizer: AutoTokenizer,
                 "input_ids": enc["input_ids"],
                 "attention_mask": enc["attention_mask"],
                 "query_id": qid,
-                "label": 1 if j == 0 else 0,  # gold must be index 0
+                "label": 1 if j == 0 else 0,
             })
 
     print(f"  ✅ Created {len(features):,} training examples")
@@ -436,7 +389,7 @@ def make_listwise_dataset(tokenizer: AutoTokenizer,
 
 
 # ------------------------
-# Collator + Sampler (keep whole query groups)
+# Collator + Sampler
 # ------------------------
 
 class QueryGroupedCollator:
@@ -467,10 +420,8 @@ class QueryGroupedCollator:
 
 
 class QueryGroupedSampler:
-    """
-    Yield batches that contain whole query groups.
-    Default: exactly ONE group per batch (best for listwise).
-    """
+    """Yield batches that contain whole query groups"""
+
     def __init__(self, dataset: SimpleDataset, groups_per_batch: int = 1):
         groups = {}
         for idx, item in enumerate(dataset.data):
@@ -499,7 +450,7 @@ class QueryGroupedSampler:
 
 
 # ------------------------
-# Custom Trainer (Listwise softmax over 10)
+# Custom Trainer
 # ------------------------
 
 class ListwiseAdapterTrainer(AdapterTrainer):
@@ -546,50 +497,79 @@ class ListwiseAdapterTrainer(AdapterTrainer):
 
 
 # ------------------------
-# Retrieval helpers
+# NEW: Score Extraction from Search Results
 # ------------------------
 
-def extract_candidates_from_search_results(search_results: List[List[Dict]]) -> List[Tuple[List[str], List[str]]]:
+def extract_candidates_and_scores(search_results: List[List[Dict]]) -> Tuple[
+    List[Tuple[List[str], List[str]]], List[List[float]]]:
+    """
+    Extract candidate aliases, IDs, AND retrieval scores from search results
+
+    Returns:
+        candidates: List of (alias_list, id_list) tuples
+        scores: List of score lists (one per query)
+    """
     candidates = []
+    all_scores = []
+
     for results in search_results:
-        cand_aliases, cand_ids = [], []
+        cand_aliases, cand_ids, cand_scores = [], [], []
         for r in results:
             entity_id = r.get('entity_id')
             alias = (r.get('primary_alias') or
                      r.get('processed_text') or
                      (r.get('aliases', [''])[0] if r.get('aliases') else '') or
                      (r.get('all_aliases', [''])[0] if r.get('all_aliases') else ''))
+
+            # Extract score - try multiple possible keys
+            score = r.get('score', r.get('similarity', r.get('distance', None)))
+
             if entity_id and alias:
                 cand_aliases.append(alias)
                 cand_ids.append(entity_id)
+                # If no score, use 0.0 as fallback (will disable fusion for this query)
+                cand_scores.append(float(score) if score is not None else 0.0)
+
         candidates.append((cand_aliases, cand_ids))
-    return candidates
+        all_scores.append(cand_scores)
+
+    return candidates, all_scores
 
 
 # ------------------------
-# Evaluation (Top-10 reranking)
+# NEW: Evaluation with Score Fusion
 # ------------------------
 
-def evaluate_reranker(rer_model, tokenizer, test_mentions, test_queries,
-                      candidates_per_query: List[Tuple[List[str], List[str]]],
-                      max_length, device, batch_size=32):
+def evaluate_reranker_with_fusion(rer_model, tokenizer, test_mentions, test_queries,
+                                  candidates_per_query: List[Tuple[List[str], List[str]]],
+                                  retrieval_scores: List[List[float]],
+                                  max_length, device, batch_size=32,
+                                  fusion_alpha=0.8, use_fusion=True):
+    """
+    Evaluate reranker with optional score fusion
+
+    Args:
+        fusion_alpha: Weight for retrieval score (0.8 = 80% retrieval, 20% reranker)
+        use_fusion: If False, uses pure reranker scores (original behavior)
+    """
     print(f"📊 Evaluating reranker on {len(test_mentions):,} test mentions...")
+    if use_fusion:
+        print(
+            f"   🔀 Fusion enabled: α={fusion_alpha:.2f} (retrieval={fusion_alpha:.0%}, reranker={1 - fusion_alpha:.0%})")
+    else:
+        print(f"   ⚠️  Fusion disabled: using pure reranker scores")
+
     rer_model.eval()
 
     metrics = {
-        'retrieval_acc1': 0,      # Gold is rank 1 in retrieval
-        'retrieval_acc10': 0,     # Gold is in top-10 retrieval
-        'rerank_acc1': 0,         # Gold is rank 1 after reranking
-        'rerank_acc10': 0,        # Gold is in top-10 after reranking
+        'retrieval_acc1': 0,
+        'retrieval_acc10': 0,
+        'rerank_acc1': 0,
+        'rerank_acc10': 0,
         'mrr': 0.0,
-        'counted': 0,
-        # Add detailed breakdown metrics
-        'gold_at_rank1': 0,       # FAISS correct @1 (already perfect)
-        'gold_in_top10_not_rank1': 0,  # FAISS wrong @1 but gold in top-10 (can improve!)
-        'gold_not_in_top10': 0    # Gold not in top-10 (cannot improve)
+        'counted': 0
     }
 
-    # FIX #8: Use tokenizer's separator token instead of hardcoded [SEP]
     sep_token = tokenizer.sep_token if tokenizer.sep_token else "[SEP]"
 
     num_batches = (len(test_mentions) + batch_size - 1) // batch_size
@@ -600,29 +580,20 @@ def evaluate_reranker(rer_model, tokenizer, test_mentions, test_queries,
         batch_mentions = test_mentions[batch_start:batch_end]
         batch_queries = test_queries[batch_start:batch_end]
         batch_candidates = candidates_per_query[batch_start:batch_end]
+        batch_ret_scores = retrieval_scores[batch_start:batch_end]
 
         batch_pairs, batch_metadata = [], []
 
         for i, m in enumerate(batch_mentions):
             gold = m["mesh"]
             cand_aliases, cand_cids = batch_candidates[i]
+            ret_scores = batch_ret_scores[i]
 
-            # Use check_mesh_match for composite IDs instead of simple 'in' check
             gold_found_in_top10 = any(check_mesh_match(cand_id, gold) for cand_id in cand_cids)
             gold_is_rank1 = check_mesh_match(cand_cids[0], gold) if cand_cids else False
 
-            # Count ALL mentions
             metrics['counted'] += 1
 
-            # Track detailed breakdown
-            if not gold_found_in_top10:
-                metrics['gold_not_in_top10'] += 1
-            elif gold_is_rank1:
-                metrics['gold_at_rank1'] += 1
-            else:
-                metrics['gold_in_top10_not_rank1'] += 1
-
-            # Track retrieval accuracy
             if gold_is_rank1:
                 metrics['retrieval_acc1'] += 1
             if gold_found_in_top10:
@@ -640,9 +611,9 @@ def evaluate_reranker(rer_model, tokenizer, test_mentions, test_queries,
                     'start_idx': start_idx,
                     'end_idx': end_idx,
                     'gold': gold,
-                    'cand_cids': cand_cids
+                    'cand_cids': cand_cids,
+                    'ret_scores': ret_scores  # NEW: Store retrieval scores
                 })
-            # If gold not found, this mention gets 0 for all reranker metrics
 
         if not batch_pairs:
             continue
@@ -656,19 +627,31 @@ def evaluate_reranker(rer_model, tokenizer, test_mentions, test_queries,
             all_logits = rer_model(**inputs).logits.squeeze(-1)
 
         for meta in batch_metadata:
-            query_logits = all_logits[meta['start_idx']:meta['end_idx']]
-            ranked_indices = torch.argsort(query_logits, descending=True).cpu().tolist()
+            query_logits = all_logits[meta['start_idx']:meta['end_idx']].cpu()
+            ret_scores_tensor = torch.tensor(meta['ret_scores'], dtype=torch.float32)
+
+            # NEW: Score fusion logic
+            if use_fusion and len(meta['ret_scores']) > 0 and max(meta['ret_scores']) > 0:
+                # Normalize both scores to [0, 1] range
+                ret_norm = (ret_scores_tensor - ret_scores_tensor.min()) / (
+                            ret_scores_tensor.max() - ret_scores_tensor.min() + 1e-8)
+                rerank_norm = (query_logits - query_logits.min()) / (query_logits.max() - query_logits.min() + 1e-8)
+
+                # Fused score: alpha * retrieval + (1-alpha) * reranker
+                fused_scores = fusion_alpha * ret_norm + (1 - fusion_alpha) * rerank_norm
+                ranked_indices = torch.argsort(fused_scores, descending=True).cpu().tolist()
+            else:
+                # Pure reranker scores (original behavior)
+                ranked_indices = torch.argsort(query_logits, descending=True).cpu().tolist()
+
             ranked_cids = [meta['cand_cids'][idx] for idx in ranked_indices]
 
-            # Use check_mesh_match for composite ID matching
             if check_mesh_match(ranked_cids[0], meta['gold']):
                 metrics['rerank_acc1'] += 1
 
-            # Check top-10 with composite ID matching
             if any(check_mesh_match(cid, meta['gold']) for cid in ranked_cids[:10]):
                 metrics['rerank_acc10'] += 1
 
-            # Calculate MRR with composite ID matching
             for rank_idx, cid in enumerate(ranked_cids):
                 if check_mesh_match(cid, meta['gold']):
                     metrics['mrr'] += 1.0 / (rank_idx + 1)
@@ -681,7 +664,6 @@ def evaluate_reranker(rer_model, tokenizer, test_mentions, test_queries,
         })
 
     total_mentions = len(test_mentions)
-    counted = max(1, metrics['counted'])
 
     return {
         'retrieval_acc1': metrics['retrieval_acc1'] / total_mentions,
@@ -689,14 +671,71 @@ def evaluate_reranker(rer_model, tokenizer, test_mentions, test_queries,
         'rerank_acc1': metrics['rerank_acc1'] / total_mentions,
         'rerank_acc10': metrics['rerank_acc10'] / total_mentions,
         'mrr': metrics['mrr'] / total_mentions,
-        'evaluated_on': f"{counted}/{total_mentions}",
-        'gold_in_top10': metrics['retrieval_acc10'],
-        # Add detailed breakdown to results
-        'gold_at_rank1': metrics['gold_at_rank1'],
-        'gold_in_top10_not_rank1': metrics['gold_in_top10_not_rank1'],
-        'gold_not_in_top10': metrics['gold_not_in_top10']
+        'evaluated_on': f"{metrics['counted']}/{total_mentions}",
+        'gold_in_top10': metrics['retrieval_acc10']
     }
 
+
+# ------------------------
+# NEW: Alpha Tuning on Validation Set
+# ------------------------
+
+def tune_fusion_alpha(rer_model, tokenizer, val_mentions, val_queries,
+                      val_candidates, val_scores, args, device):
+    """
+    Find the best fusion_alpha on validation set
+    Tests: [0.5, 0.7, 0.8, 0.9, 0.95]
+    """
+    print("\n" + "=" * 70)
+    print("🔧 TUNING FUSION ALPHA ON VALIDATION SET")
+    print("=" * 70)
+
+    alphas_to_test = [0.5, 0.7, 0.8, 0.9, 0.95]
+    best_alpha = 0.8
+    best_acc1 = -1.0
+
+    results_table = []
+
+    for alpha in alphas_to_test:
+        print(f"\n📊 Testing α={alpha:.2f}...")
+        results = evaluate_reranker_with_fusion(
+            rer_model, tokenizer, val_mentions, val_queries,
+            val_candidates, val_scores,
+            args.max_length, device, batch_size=args.eval_batch_size,
+            fusion_alpha=alpha, use_fusion=True
+        )
+
+        acc1 = results['rerank_acc1']
+        results_table.append({
+            'alpha': alpha,
+            'acc1': acc1,
+            'acc10': results['rerank_acc10'],
+            'mrr': results['mrr']
+        })
+
+        print(f"   Rerank Acc@1: {acc1 * 100:.2f}%")
+
+        if acc1 > best_acc1:
+            best_acc1 = acc1
+            best_alpha = alpha
+
+    print("\n" + "=" * 70)
+    print("ALPHA TUNING RESULTS")
+    print("=" * 70)
+    print(f"{'Alpha':>8} {'Acc@1':>10} {'Acc@10':>10} {'MRR':>10}")
+    print("-" * 70)
+    for r in results_table:
+        marker = " ⭐" if r['alpha'] == best_alpha else ""
+        print(f"{r['alpha']:>8.2f} {r['acc1'] * 100:>9.2f}% {r['acc10'] * 100:>9.2f}% {r['mrr']:>10.4f}{marker}")
+    print("=" * 70)
+    print(f"\n✨ Best α: {best_alpha:.2f} (Acc@1: {best_acc1 * 100:.2f}%)")
+
+    return best_alpha
+
+
+# ------------------------
+# Evaluation Runner
+# ------------------------
 
 def run_eval_on_split(split_name: str,
                       ds: Dict,
@@ -705,13 +744,17 @@ def run_eval_on_split(split_name: str,
                       rer_model: AutoAdapterModel,
                       args,
                       device,
-                      category: str = "Both"):
+                      category: str = "Both",
+                      fusion_alpha: float = 0.8):
     if split_name not in ds:
         print(f"\n⚠️  Split '{split_name}' not found. Available: {list(ds.keys())}")
         return None
 
     print("\n" + "=" * 70)
-    print(f"[EVAL] {split_name.upper()} SPLIT (TOP-10, CATEGORY: {category.upper()})".center(70))
+    header = f"[EVAL] {split_name.upper()} SPLIT (TOP-10, CATEGORY: {category.upper()})"
+    if args.use_fusion:
+        header += f" [FUSION α={fusion_alpha:.2f}]"
+    print(header.center(70))
     print("=" * 70)
 
     mentions = collect_mentions(ds[split_name], split_name, category)
@@ -719,50 +762,34 @@ def run_eval_on_split(split_name: str,
         print(f"  ⚠️  No mentions in {split_name} split — skipping.")
         return None
 
-    # Separate retrieval queries (plain text) from rerank queries (with context/markers)
-    retrieval_queries = [to_retrieval_query(m) for m in tqdm(mentions, desc=f"Building {split_name} retrieval queries", leave=False)]
+    retrieval_queries = [to_retrieval_query(m) for m in
+                         tqdm(mentions, desc=f"Building {split_name} retrieval queries", leave=False)]
 
     if args.query_mode == "context":
-        rerank_queries = [to_rerank_query(m, window_chars=args.context_window_chars) for m in tqdm(mentions, desc=f"Building {split_name} rerank queries", leave=False)]
+        rerank_queries = [to_rerank_query(m, window_chars=args.context_window_chars) for m in
+                          tqdm(mentions, desc=f"Building {split_name} rerank queries", leave=False)]
     else:
-        rerank_queries = [to_retrieval_query(m) for m in mentions]  # mention-only mode uses same for both
+        rerank_queries = [to_retrieval_query(m) for m in mentions]
 
     print(f"🔍 Retrieving top-10 candidates using SAPBERTIndexSearcher...")
-    search_results = searcher.batch_search(retrieval_queries, k=10)  # ✅ Use plain text for retrieval
-    candidates = extract_candidates_from_search_results(search_results)
+    search_results = searcher.batch_search(retrieval_queries, k=10)
+    candidates, ret_scores = extract_candidates_and_scores(search_results)
 
-    # Diagnostic: Check retrieval recall before reranking
-    gold_in_top10 = 0
-    missing_examples = []
-    for i, m in enumerate(mentions[:min(10, len(mentions))]):  # Check first 10 examples
-        gold = m["mesh"]
-        cand_aliases, cand_cids = candidates[i]
-        # Use check_mesh_match instead of simple 'in' check for composite IDs
-        if any(check_mesh_match(cand_id, gold) for cand_id in cand_cids):
-            gold_in_top10 += 1
-        else:
-            missing_examples.append({
-                'mention': m['text'],
-                'gold': gold,
-                'retrieved': cand_cids[:3] if len(cand_cids) >= 3 else cand_cids
-            })
+    # Check if we have valid scores
+    has_scores = any(max(scores) > 0 if scores else False for scores in ret_scores)
+    if args.use_fusion and not has_scores:
+        print(f"  ⚠️  WARNING: No retrieval scores found in search results!")
+        print(f"  ⚠️  Fusion will be disabled for this evaluation.")
+        print(f"  ℹ️  To enable fusion, ensure SAPBERTIndexSearcher returns 'score' or 'similarity' in results.")
+        use_fusion_actual = False
+    else:
+        use_fusion_actual = args.use_fusion
 
-    print(f"  🔍 Diagnostic: Gold in top-10 for first 10 queries: {gold_in_top10}/10")
-    if missing_examples:
-        print(f"  ⚠️  Sample missing examples:")
-        for ex in missing_examples[:3]:
-            print(f"     Mention: '{ex['mention']}' | Gold: {ex['gold']} | Top-3 Retrieved: {ex['retrieved']}")
-
-    results = evaluate_reranker(
-        rer_model, tokenizer, mentions, rerank_queries, candidates,  # ✅ Use rerank queries with context/markers
-        args.max_length, device, batch_size=args.eval_batch_size
+    results = evaluate_reranker_with_fusion(
+        rer_model, tokenizer, mentions, rerank_queries, candidates, ret_scores,
+        args.max_length, device, batch_size=args.eval_batch_size,
+        fusion_alpha=fusion_alpha, use_fusion=use_fusion_actual
     )
-
-    # Print detailed breakdown
-    total = len(mentions)
-    gold_at_rank1 = results.get('gold_at_rank1', 0)
-    gold_in_top10_not_rank1 = results.get('gold_in_top10_not_rank1', 0)
-    gold_not_in_top10 = results.get('gold_not_in_top10', 0)
 
     print("\n" + "-" * 70)
     print(f"{split_name.upper()} EVALUATION RESULTS (TOP-10, CATEGORY: {category.upper()})".center(70))
@@ -773,52 +800,26 @@ def run_eval_on_split(split_name: str,
     print(f"🥇 Reranker Acc@1:          {results['rerank_acc1'] * 100:>6.2f}%")
     print(f"🏅 Reranker Acc@10:         {results['rerank_acc10'] * 100:>6.2f}%")
     print(f"📈 Mean Reciprocal Rank:    {results['mrr']:>6.4f}")
-    print("-" * 70)
-
-    print(f"\n📊 Detailed Breakdown:")
-    print(f"  {'='*60}")
-    print(f"  ✅ FAISS correct @1:               {gold_at_rank1:>8,} ({gold_at_rank1/total*100:>5.2f}%)")
-    print(f"     (Already perfect - no improvement needed)")
-    print(f"  ")
-    print(f"  🎯 FAISS wrong @1, gold in top-10: {gold_in_top10_not_rank1:>8,} ({gold_in_top10_not_rank1/total*100:>5.2f}%)")
-    print(f"     ⭐ THIS IS WHAT RERANKING CAN IMPROVE!")
-    print(f"  ")
-    print(f"  ❌ Gold not in top-10:             {gold_not_in_top10:>8,} ({gold_not_in_top10/total*100:>5.2f}%)")
-    print(f"     (Cannot improve with reranking)")
-    print(f"  {'='*60}")
-    print(f"  Total:                             {total:>8,} (100.00%)")
-    print(f"  {'='*60}")
-
-    # Calculate actual improvement achieved
-    if gold_in_top10_not_rank1 > 0:
-        # How many of the improvable cases did we actually improve?
-        rerank_correct = int(results['rerank_acc1'] * total)
-        retrieval_correct = int(results['retrieval_acc1'] * total)
-        actual_improvements = rerank_correct - retrieval_correct
-        improvement_rate = (actual_improvements / gold_in_top10_not_rank1) * 100 if gold_in_top10_not_rank1 > 0 else 0
-
-        print(f"\n💡 Reranking Impact:")
-        print(f"   Cases that can be improved:     {gold_in_top10_not_rank1:>8,}")
-        print(f"   Actually improved by reranker:  {actual_improvements:>8,} ({improvement_rate:>5.2f}%)")
-        print(f"   Absolute accuracy gain:         {(results['rerank_acc1'] - results['retrieval_acc1']) * 100:>6.2f}%")
-
+    if use_fusion_actual:
+        print(f"🔀 Fusion α:                {fusion_alpha:.2f}")
     print("-" * 70 + "\n")
 
     return results
 
 
 # ------------------------
-# Validation Callback for Best Model Selection
+# Validation Callback
 # ------------------------
 
 class ValidationCallback(TrainerCallback):
     """Callback to evaluate on validation set after each epoch and save best model"""
 
-    def __init__(self, val_mentions, val_queries, val_candidates, searcher, tokenizer,
-                 args, device, ds, output_dir, category="Both", csv_path=None):
+    def __init__(self, val_mentions, val_queries, val_candidates, val_scores, searcher, tokenizer,
+                 args, device, ds, output_dir, category="Both", csv_path=None, fusion_alpha=0.8):
         self.val_mentions = val_mentions
         self.val_queries = val_queries
         self.val_candidates = val_candidates
+        self.val_scores = val_scores
         self.searcher = searcher
         self.tokenizer = tokenizer
         self.args = args
@@ -829,19 +830,24 @@ class ValidationCallback(TrainerCallback):
         self.best_val_rerank_top1 = -1.0
         self.best_epoch = 0
         self.csv_path = csv_path if csv_path else os.path.join(output_dir, "training_results.csv")
+        self.fusion_alpha = fusion_alpha
 
     def on_epoch_end(self, args, state, control, model=None, **kwargs):
         """Evaluate on validation set at the end of each epoch"""
         epoch = int(state.epoch)
-        print(f"\n{'='*70}")
+        print(f"\n{'=' * 70}")
         print(f"🔎 VALIDATION AFTER EPOCH {epoch}".center(70))
-        print(f"{'='*70}")
+        print(f"{'=' * 70}")
 
-        # Evaluate on validation set
-        results = evaluate_reranker(
+        # Check if we have valid scores
+        has_scores = any(max(scores) > 0 if scores else False for scores in self.val_scores)
+        use_fusion_actual = self.args.use_fusion and has_scores
+
+        results = evaluate_reranker_with_fusion(
             model, self.tokenizer, self.val_mentions, self.val_queries,
-            self.val_candidates, self.args.max_length, self.device,
-            batch_size=self.args.eval_batch_size
+            self.val_candidates, self.val_scores, self.args.max_length, self.device,
+            batch_size=self.args.eval_batch_size,
+            fusion_alpha=self.fusion_alpha, use_fusion=use_fusion_actual
         )
 
         val_rerank_acc1 = results['rerank_acc1']
@@ -852,8 +858,9 @@ class ValidationCallback(TrainerCallback):
         print(f"  🥇 Reranker Acc@1:          {val_rerank_acc1 * 100:>6.2f}%")
         print(f"  🏅 Reranker Acc@10:         {results['rerank_acc10'] * 100:>6.2f}%")
         print(f"  📈 Mean Reciprocal Rank:    {results['mrr']:>6.4f}")
+        if use_fusion_actual:
+            print(f"  🔀 Fusion α:                {self.fusion_alpha:.2f}")
 
-        # Write validation results to CSV
         validation_results = {f'validation_{self.category.lower()}': results}
         write_results_to_csv(
             validation_results,
@@ -863,12 +870,10 @@ class ValidationCallback(TrainerCallback):
             context_window_chars=self.args.context_window_chars
         )
 
-        # Check if this is the best model so far
         if val_rerank_acc1 > self.best_val_rerank_top1:
             self.best_val_rerank_top1 = val_rerank_acc1
             self.best_epoch = epoch
 
-            # Save best model
             best_model_dir = os.path.join(self.output_dir, "best_model")
             print(f"\n✨ New best model! Saving to {best_model_dir}")
             print(f"   Best validation rerank_acc1: {val_rerank_acc1 * 100:.2f}% (epoch {epoch})")
@@ -877,7 +882,6 @@ class ValidationCallback(TrainerCallback):
             model.save_adapter(best_model_dir, self.args.rerank_adapter_name)
             self.tokenizer.save_pretrained(best_model_dir)
 
-            # Save metadata
             import json
             metadata = {
                 'epoch': epoch,
@@ -886,14 +890,17 @@ class ValidationCallback(TrainerCallback):
                 'val_retrieval_acc10': results['retrieval_acc10'],
                 'val_rerank_acc10': results['rerank_acc10'],
                 'val_mrr': results['mrr'],
-                'category': self.category
+                'category': self.category,
+                'use_fusion': use_fusion_actual,
+                'fusion_alpha': self.fusion_alpha if use_fusion_actual else None
             }
             with open(os.path.join(best_model_dir, 'best_model_metadata.json'), 'w') as f:
                 json.dump(metadata, f, indent=2)
         else:
-            print(f"\n   Current: {val_rerank_acc1 * 100:.2f}% | Best: {self.best_val_rerank_top1 * 100:.2f}% (epoch {self.best_epoch})")
+            print(
+                f"\n   Current: {val_rerank_acc1 * 100:.2f}% | Best: {self.best_val_rerank_top1 * 100:.2f}% (epoch {self.best_epoch})")
 
-        print(f"{'='*70}\n")
+        print(f"{'=' * 70}\n")
 
         return control
 
@@ -910,7 +917,6 @@ def main():
     if not HAS_FAISS:
         raise RuntimeError("FAISS not available. Install with: pip install faiss-cpu (or faiss-gpu)")
 
-    # enforce k=10 for everything
     args.k = 10
 
     if torch.cuda.is_available():
@@ -919,21 +925,29 @@ def main():
         device = torch.device("mps")
     else:
         device = torch.device("cpu")
+
     print("\n" + "=" * 70)
-    print("BC5CDR RERANKER TRAINER (Train@10 / Eval@10)".center(70))
+    print("BC5CDR RERANKER TRAINER WITH SCORE FUSION".center(70))
     print("=" * 70)
     print(f"🖥️  Device: {device}")
     print(f"🌱 Seed: {args.seed}")
     print(f"🎯 Candidate set size (k): 10")
+    if args.use_fusion:
+        if args.tune_alpha:
+            print(f"🔀 Fusion: ENABLED (auto-tune α on validation)")
+        else:
+            print(f"🔀 Fusion: ENABLED (α={args.fusion_alpha:.2f})")
+    else:
+        print(f"🔀 Fusion: DISABLED (pure reranker)")
     print()
 
-    # STEP 1
+    # STEP 1: Load dataset
     print("\n" + "=" * 70)
     print("[STEP 1/7] LOAD BC5CDR DATASET")
     print("=" * 70)
     ds = load_bc5cdr(pubtator_path=args.pubtator_path)
 
-    # STEP 2
+    # STEP 2: Initialize searcher
     print("\n" + "=" * 70)
     print("[STEP 2/7] INITIALIZE SAPBERT INDEX SEARCHER")
     print("=" * 70)
@@ -945,14 +959,13 @@ def main():
     )
     searcher.load_index(args.faiss_index_path)
     stats = searcher.get_index_stats()
-    print(f"  ✅ Entities: {stats.get('num_entities','?'):,}")
-    print(f"  ✅ Index type: {stats.get('index_type','?')}")
+    print(f"  ✅ Entities: {stats.get('num_entities', '?'):,}")
+    print(f"  ✅ Index type: {stats.get('index_type', '?')}")
     print(f"  ✅ Adapter: {'ON' if stats.get('use_adapter') else 'OFF'}")
 
-    # ensure tokenizer ready
     searcher._load_model()
 
-    # STEP 3
+    # STEP 3: Prepare training data
     print("\n" + "=" * 70)
     print(f"[STEP 3/7] PREPARE {args.train_split.upper()} SPLIT FOR TRAINING")
     print("=" * 70)
@@ -961,34 +974,41 @@ def main():
     print(f"  ✅ Collected {len(train_mentions):,} mentions")
 
     print(f"🔄 Building queries (mode: {args.query_mode})...")
-    # Separate retrieval queries (plain text) from rerank queries (with context/markers)
-    train_retrieval_queries = [to_retrieval_query(m) for m in tqdm(train_mentions, desc="Building retrieval queries", leave=False)]
+    train_retrieval_queries = [to_retrieval_query(m) for m in
+                               tqdm(train_mentions, desc="Building retrieval queries", leave=False)]
 
     if args.query_mode == "context":
-        train_rerank_queries = [to_rerank_query(m, window_chars=args.context_window_chars) for m in tqdm(train_mentions, desc="Building rerank queries", leave=False)]
+        train_rerank_queries = [to_rerank_query(m, window_chars=args.context_window_chars) for m in
+                                tqdm(train_mentions, desc="Building rerank queries", leave=False)]
     else:
-        train_rerank_queries = [to_retrieval_query(m) for m in train_mentions]  # mention-only mode uses same for both
+        train_rerank_queries = [to_retrieval_query(m) for m in train_mentions]
 
     print(f"🔍 Retrieving top-10 candidates using SAPBERTIndexSearcher...")
-    train_search_results = searcher.batch_search(train_retrieval_queries, k=10)  # ✅ Use plain text for retrieval
-    train_candidates = extract_candidates_from_search_results(train_search_results)
+    train_search_results = searcher.batch_search(train_retrieval_queries, k=10)
+    train_candidates, train_scores = extract_candidates_and_scores(train_search_results)
+
+    # Check if scores are available
+    has_train_scores = any(max(scores) > 0 if scores else False for scores in train_scores)
+    if args.use_fusion and not has_train_scores:
+        print(f"  ⚠️  WARNING: No retrieval scores found in search results!")
+        print(
+            f"  ℹ️  Sample result keys: {list(train_search_results[0][0].keys()) if train_search_results and train_search_results[0] else 'N/A'}")
+        print(f"  ℹ️  Fusion will be disabled during evaluation.")
 
     print(f"🔗 Building training groups (gold + top-9 negatives from top-10)...")
     pairs: List[Tuple[str, List[str]]] = []
     kept = 0
-    forced_gold = 0  # Track how many times we forced gold into candidates
+    forced_gold = 0
 
-    # Track different categories for analysis
-    gold_at_rank1 = 0  # FAISS correct @1 (already perfect)
-    gold_in_top10_not_rank1 = 0  # FAISS wrong @1 but gold in top-10 (can improve!)
-    gold_not_in_top10 = 0  # Gold not in top-10 (cannot improve with reranking)
+    gold_at_rank1 = 0
+    gold_in_top10_not_rank1 = 0
+    gold_not_in_top10 = 0
 
     for i in tqdm(range(len(train_mentions)), desc="Creating pairs", leave=False):
         m = train_mentions[i]
         gold = m["mesh"]
-        cand_aliases, cand_cids = train_candidates[i]  # already top-10
+        cand_aliases, cand_cids = train_candidates[i]
 
-        # Use check_mesh_match instead of simple 'in' check for composite IDs
         gold_found = False
         gold_idx = -1
         for idx, cand_id in enumerate(cand_cids):
@@ -998,57 +1018,49 @@ def main():
                 break
 
         if not gold_found:
-            # Gold not in top-10 - cannot improve with reranking
             gold_not_in_top10 += 1
-            # FIX: Instead of skipping, force gold entity into candidates at position 0
-            # Use the mention text as the gold alias
             gold_alias = m["text"]
-            # Take top-9 retrieved candidates as negatives
             negs = cand_aliases[:9] if len(cand_aliases) >= 9 else cand_aliases
             forced_gold += 1
         else:
-            # Gold found in top-10
             if gold_idx == 0:
-                # FAISS already got it right @1 - no room for improvement
                 gold_at_rank1 += 1
             else:
-                # FAISS wrong @1 but gold in top-10 - THIS IS WHAT WE CAN IMPROVE!
                 gold_in_top10_not_rank1 += 1
 
-            # gold alias + remaining negatives from within top-10
             gold_alias = cand_aliases[gold_idx]
             negs = [a for j, (a, c) in enumerate(zip(cand_aliases, cand_cids)) if j != gold_idx]
 
-        # group size <= 10 always
         cand_list = [gold_alias] + negs
-        pairs.append((train_rerank_queries[i], cand_list))  # ✅ Use rerank query with context/markers
+        pairs.append((train_rerank_queries[i], cand_list))
         kept += 1
 
     total_mentions = len(train_mentions)
 
     print(f"\n📊 Training Data Analysis:")
-    print(f"  {'='*60}")
+    print(f"  {'=' * 60}")
     print(f"  Total mentions:                    {total_mentions:>8,}")
-    print(f"  {'='*60}")
-    print(f"  ✅ FAISS correct @1:               {gold_at_rank1:>8,} ({gold_at_rank1/total_mentions*100:>5.2f}%)")
+    print(f"  {'=' * 60}")
+    print(f"  ✅ FAISS correct @1:               {gold_at_rank1:>8,} ({gold_at_rank1 / total_mentions * 100:>5.2f}%)")
     print(f"     (Already perfect - no improvement needed)")
     print(f"  ")
-    print(f"  🎯 FAISS wrong @1, gold in top-10: {gold_in_top10_not_rank1:>8,} ({gold_in_top10_not_rank1/total_mentions*100:>5.2f}%)")
+    print(
+        f"  🎯 FAISS wrong @1, gold in top-10: {gold_in_top10_not_rank1:>8,} ({gold_in_top10_not_rank1 / total_mentions * 100:>5.2f}%)")
     print(f"     ⭐ THIS IS WHAT RERANKING CAN IMPROVE!")
     print(f"  ")
-    print(f"  ❌ Gold not in top-10:             {gold_not_in_top10:>8,} ({gold_not_in_top10/total_mentions*100:>5.2f}%)")
+    print(
+        f"  ❌ Gold not in top-10:             {gold_not_in_top10:>8,} ({gold_not_in_top10 / total_mentions * 100:>5.2f}%)")
     print(f"     (Cannot improve with reranking)")
-    print(f"  {'='*60}")
+    print(f"  {'=' * 60}")
     print(f"  Total:                             {total_mentions:>8,} (100.00%)")
-    print(f"  {'='*60}")
+    print(f"  {'=' * 60}")
     print(f"\n💡 Key Insight:")
-    print(f"   Maximum possible improvement from reranking: {gold_in_top10_not_rank1/total_mentions*100:.2f}%")
+    print(f"   Maximum possible improvement from reranking: {gold_in_top10_not_rank1 / total_mentions * 100:.2f}%")
     print(f"   (If reranker can perfectly move all rank 2-10 to rank 1)\n")
 
     print(f"  ✅ Created {kept:,} training groups (100% of mentions)")
-    print(f"  ✅ Group size: 1 positive + up to 9 negatives")
 
-    # STEP 4
+    # STEP 4: Build reranker
     print("\n" + "=" * 70)
     print("[STEP 4/7] BUILD RERANKER ADAPTER & DATASET")
     print("=" * 70)
@@ -1069,7 +1081,6 @@ def main():
     rer_model.train_adapter(args.rerank_adapter_name)
     rer_model.to(device)
 
-    # FIX #7: Add special tokens for [MENTION] markers and resize embeddings
     tok = AutoTokenizer.from_pretrained(args.base_model, use_fast=True)
     if args.query_mode == "context":
         special_tokens = {"additional_special_tokens": ["[MENTION]", "[/MENTION]"]}
@@ -1078,17 +1089,14 @@ def main():
             print(f"  ✅ Added {num_added} special tokens: [MENTION], [/MENTION]")
             rer_model.resize_token_embeddings(len(tok))
             print(f"  ✅ Resized model embeddings to {len(tok)}")
-        else:
-            print(f"  ℹ️  Special tokens already present")
 
     train_ds = make_listwise_dataset(tok, pairs, max_length=args.max_length)
 
-    # FIX: Initialize W&B with proper run configuration for resumable training
     if HAS_WANDB:
-        # Create a unique but consistent run name based on configuration
         run_name = f"bc5cdr_rerank_{args.category}_{args.query_mode}_lr{args.lr}_e{args.epochs}"
+        if args.use_fusion:
+            run_name += f"_fusion{args.fusion_alpha:.2f}"
 
-        # Initialize W&B run with resume capability
         wandb.init(
             project="bc5cdr-reranker",
             name=run_name,
@@ -1104,14 +1112,13 @@ def main():
                 "category": args.category,
                 "seed": args.seed,
                 "weight_decay": args.weight_decay,
+                "use_fusion": args.use_fusion,
+                "fusion_alpha": args.fusion_alpha if args.use_fusion else None,
             },
-            resume="allow",  # Allow resuming if run exists
-            id=run_name.replace(".", "_").replace("/", "_"),  # Consistent ID for resume
+            resume="allow",
+            id=run_name.replace(".", "_").replace("/", "_"),
         )
         print(f"  ✅ W&B initialized: project=bc5cdr-reranker, run={run_name}")
-        print(f"  ✅ Run can be resumed with same parameters")
-    else:
-        print("  ⚠️  W&B not available - training metrics will not be logged to W&B")
 
     args_hf = TrainingArguments(
         output_dir=args.output_dir,
@@ -1124,12 +1131,12 @@ def main():
         save_strategy="epoch",
         eval_strategy="no",
         remove_unused_columns=False,
-        report_to=["wandb"] if HAS_WANDB else [],  # Only report to W&B if available
+        report_to=["wandb"] if HAS_WANDB else [],
         seed=args.seed,
         use_mps_device=(device.type == "mps")
     )
 
-    # STEP 5
+    # STEP 5: Training
     print("\n" + "=" * 70)
     print("[STEP 5/7] TRAIN RERANKER ADAPTER")
     print("=" * 70)
@@ -1146,30 +1153,41 @@ def main():
         data_collator=collator,
     )
 
-    # Prepare validation data for callback
+    # Prepare validation data
     print("\n" + "=" * 70)
-    print("[STEP 5.5/7] PREPARE VALIDATION SPLIT FOR EPOCH CALLBACKS")
+    print("[STEP 5.5/7] PREPARE VALIDATION SPLIT")
     print("=" * 70)
 
     val_mentions = collect_mentions(ds['validation'], 'validation', args.category)
     print(f"  ✅ Collected {len(val_mentions):,} validation mentions")
 
-    # Build retrieval and rerank queries for validation (same as training)
-    val_retrieval_queries = [to_retrieval_query(m) for m in tqdm(val_mentions, desc="Building validation retrieval queries", leave=False)]
+    val_retrieval_queries = [to_retrieval_query(m) for m in
+                             tqdm(val_mentions, desc="Building validation retrieval queries", leave=False)]
 
     if args.query_mode == "context":
-        val_rerank_queries = [to_rerank_query(m, window_chars=args.context_window_chars) for m in tqdm(val_mentions, desc="Building validation rerank queries", leave=False)]
+        val_rerank_queries = [to_rerank_query(m, window_chars=args.context_window_chars) for m in
+                              tqdm(val_mentions, desc="Building validation rerank queries", leave=False)]
     else:
         val_rerank_queries = [to_retrieval_query(m) for m in val_mentions]
 
     print(f"🔍 Retrieving validation candidates...")
-    val_search_results = searcher.batch_search(val_retrieval_queries, k=10)  # ✅ Use plain text for retrieval
-    val_candidates = extract_candidates_from_search_results(val_search_results)
+    val_search_results = searcher.batch_search(val_retrieval_queries, k=10)
+    val_candidates, val_scores = extract_candidates_and_scores(val_search_results)
+
+    # STEP 5.75: Tune alpha if requested
+    fusion_alpha = args.fusion_alpha
+    if args.tune_alpha and args.use_fusion:
+        fusion_alpha = tune_fusion_alpha(
+            rer_model, tok, val_mentions, val_rerank_queries,
+            val_candidates, val_scores, args, device
+        )
+        print(f"\n✨ Using tuned α={fusion_alpha:.2f} for training and evaluation")
 
     validation_callback = ValidationCallback(
         val_mentions=val_mentions,
-        val_queries=val_rerank_queries,  # ✅ Use rerank queries with context/markers
+        val_queries=val_rerank_queries,
         val_candidates=val_candidates,
+        val_scores=val_scores,
         searcher=searcher,
         tokenizer=tok,
         args=args,
@@ -1177,10 +1195,10 @@ def main():
         ds=ds,
         output_dir=args.output_dir,
         category=args.category,
-        csv_path=os.path.join(args.output_dir, "training_results.csv")
+        csv_path=os.path.join(args.output_dir, "training_results.csv"),
+        fusion_alpha=fusion_alpha
     )
 
-    # Add callback to trainer
     trainer.add_callback(validation_callback)
 
     if not args.evaluate_only and args.epochs > 0:
@@ -1194,11 +1212,12 @@ def main():
         rer_model.save_adapter(args.output_dir, args.rerank_adapter_name)
         print(f"  ✅ Model saved successfully")
 
-        # Load best model for final evaluation
+        # Load best model
         best_model_path = os.path.join(args.output_dir, "best_model")
         if os.path.exists(best_model_path):
             print(f"\n🏆 Loading best model from: {best_model_path}")
-            print(f"   Best validation rerank_top1: {validation_callback.best_val_rerank_top1 * 100:.2f}% (epoch {validation_callback.best_epoch})")
+            print(
+                f"   Best validation rerank_top1: {validation_callback.best_val_rerank_top1 * 100:.2f}% (epoch {validation_callback.best_epoch})")
             rer_model = AutoAdapterModel.from_pretrained(args.base_model)
             rer_model.load_adapter(best_model_path, load_as=args.rerank_adapter_name, with_head=True)
             rer_model.set_active_adapters([args.rerank_adapter_name])
@@ -1206,47 +1225,48 @@ def main():
     else:
         print("  ⏭️  Skipping training (evaluate_only or epochs=0)")
 
-    # Evaluate on all splits - always show Disease and Chemical separately
+    # Final evaluation
     print("\n" + "=" * 70)
     print("FINAL EVALUATION PHASE (BEST MODEL)".center(70))
     print("=" * 70)
 
-    # Prepare CSV path for final evaluation
     final_csv_path = os.path.join(args.output_dir, "final_evaluation_results.csv")
     all_final_results = {}
 
     print(f"\n📝 Final evaluation results will be saved to: {final_csv_path}")
 
     if args.category == "Both":
-        # Evaluate both categories separately
         for split in ["train", "validation", "test"]:
-            disease_results = run_eval_on_split(split, ds, searcher, tok, rer_model, args, device, category="Disease")
-            chemical_results = run_eval_on_split(split, ds, searcher, tok, rer_model, args, device, category="Chemical")
+            disease_results = run_eval_on_split(split, ds, searcher, tok, rer_model, args, device,
+                                                category="Disease", fusion_alpha=fusion_alpha)
+            chemical_results = run_eval_on_split(split, ds, searcher, tok, rer_model, args, device,
+                                                 category="Chemical", fusion_alpha=fusion_alpha)
             if disease_results:
                 all_final_results[f"{split}_disease"] = disease_results
             if chemical_results:
                 all_final_results[f"{split}_chemical"] = chemical_results
     else:
-        # Evaluate only the selected category
         for split in ["train", "validation", "test"]:
-            results = run_eval_on_split(split, ds, searcher, tok, rer_model, args, device, category=args.category)
+            results = run_eval_on_split(split, ds, searcher, tok, rer_model, args, device,
+                                        category=args.category, fusion_alpha=fusion_alpha)
             if results:
                 all_final_results[f"{split}_{args.category.lower()}"] = results
 
-    # Write final evaluation results to CSV
     if all_final_results:
         print(f"\n📊 Writing {len(all_final_results)} evaluation result(s) to CSV...")
         best_epoch = validation_callback.best_epoch if not args.evaluate_only and args.epochs > 0 else None
         write_results_to_csv(
             all_final_results,
             final_csv_path,
-            description="Best Model Final Evaluation",
+            description="Best Model Final Evaluation with Fusion" if args.use_fusion else "Best Model Final Evaluation",
             epoch=best_epoch,
             context_window_chars=args.context_window_chars
         )
         print(f"✅ Final evaluation results saved to: {final_csv_path}")
-    else:
-        print("⚠️  No final evaluation results to write to CSV")
+
+    print("\n" + "=" * 70)
+    print("✨ TRAINING AND EVALUATION COMPLETE!")
+    print("=" * 70)
 
 
 if __name__ == "__main__":

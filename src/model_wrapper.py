@@ -53,6 +53,7 @@ class Model_Wrapper(object):
         self.tokenizer = AutoTokenizer.from_pretrained(path, 
                 use_fast=True, do_lower_case=lowercase)
         self.encoder = AutoModel.from_pretrained(path, trust_remote_code=trust_remote_code)
+        print("======= Using Cuda: {} =======".format(use_cuda))
         if use_cuda:
             self.encoder = self.encoder.cuda()
 
@@ -135,7 +136,7 @@ class Model_Wrapper(object):
 
         res = None
         for i in tqdm(np.arange(0, score_matrix.shape[0], batch_size), disable=not show_progress):
-            score_matrix_tmp = torch.tensor(score_matrix[i:i+batch_size]).cuda()
+            score_matrix_tmp = torch.tensor(score_matrix[i:i+batch_size])
             matrix_sorted = torch.argsort(score_matrix_tmp, dim=1, descending=True)[:, :topk].cpu()
             if res is None: 
                 res = matrix_sorted
@@ -166,6 +167,7 @@ class Model_Wrapper(object):
         #print ("converting names to list...")
         #names = names.tolist()
 
+        device = next(self.encoder.parameters()).device
         with torch.no_grad():
             if show_progress:
                 iterations = tqdm(range(0, len(names), batch_size))
@@ -179,9 +181,7 @@ class Model_Wrapper(object):
                         batch, add_special_tokens=True, 
                         truncation=True, max_length=25, 
                         padding="max_length", return_tensors='pt')
-                batch_tokenized_names_cuda = {}
-                for k,v in batch_tokenized_names.items(): 
-                    batch_tokenized_names_cuda[k] = v.cuda()
+                batch_tokenized_names_cuda = {k: v.to(device) for k, v in batch_tokenized_names.items()}
                 
                 last_hidden_state = self.encoder(**batch_tokenized_names_cuda)[0]
                 if agg_mode == "cls":
