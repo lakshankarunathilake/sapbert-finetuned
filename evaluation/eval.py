@@ -92,6 +92,16 @@ def main(args):
     # load dictionary and data
     eval_dictionary = load_dictionary(dictionary_path=args.dictionary_path)
     print ("[reference dictionary loaded]")
+    
+    # Log dictionary statistics
+    LOGGER.info("="*60)
+    LOGGER.info("DICTIONARY STATISTICS")
+    LOGGER.info("="*60)
+    LOGGER.info(f"Total dictionary entries: {len(eval_dictionary)}")
+    unique_dict_cuis = set([row[1] for row in eval_dictionary])
+    LOGGER.info(f"Unique CUIs in dictionary: {len(unique_dict_cuis)}")
+    LOGGER.info("")
+    
     #if "chv-dev" in args.data_dir:
     if args.cometa:
         print ("[loading COMETA queries...]")
@@ -115,6 +125,48 @@ def main(args):
             filter_composite=args.filter_composite,
             filter_duplicate=args.filter_duplicate
             )
+
+    # Log test dataset statistics
+    LOGGER.info("="*60)
+    LOGGER.info("TEST DATASET STATISTICS")
+    LOGGER.info("="*60)
+    LOGGER.info(f"Total queries: {len(eval_queries)}")
+    
+    # Count unique mentions and CUIs
+    all_mentions = []
+    all_cuis = []
+    for query in eval_queries:
+        # query format: [mention_text, cui]
+        mention = query[0].replace("+","|")  # handle composite mentions
+        cui = query[1].replace("+","|")  # handle composite CUIs
+        
+        # Split composite mentions/CUIs
+        mentions_split = mention.split("|")
+        cuis_split = cui.split("|")
+        
+        all_mentions.extend(mentions_split)
+        all_cuis.extend(cuis_split)
+    
+    unique_mentions = set([m.strip().lower() for m in all_mentions])
+    unique_cuis = set([c.strip() for c in all_cuis])
+    
+    LOGGER.info(f"Total mention occurrences: {len(all_mentions)}")
+    LOGGER.info(f"Unique mentions (case-insensitive): {len(unique_mentions)}")
+    LOGGER.info(f"Unique CUIs in test set: {len(unique_cuis)}")
+    
+    # Check coverage
+    cuis_in_dict = unique_cuis.intersection(unique_dict_cuis)
+    cuis_not_in_dict = unique_cuis - unique_dict_cuis
+    
+    LOGGER.info(f"CUIs covered by dictionary: {len(cuis_in_dict)} ({len(cuis_in_dict)/len(unique_cuis)*100:.1f}%)")
+    if len(cuis_not_in_dict) > 0:
+        LOGGER.info(f"CUIs NOT in dictionary: {len(cuis_not_in_dict)} ({len(cuis_not_in_dict)/len(unique_cuis)*100:.1f}%)")
+        if len(cuis_not_in_dict) <= 10:
+            LOGGER.info(f"Missing CUIs: {list(cuis_not_in_dict)}")
+    
+    LOGGER.info(f"Average mentions per query: {len(all_mentions)/len(eval_queries):.2f}")
+    LOGGER.info("="*60)
+    LOGGER.info("")
 
     model_wrapper = Model_Wrapper().load_model(
             path=args.model_dir,

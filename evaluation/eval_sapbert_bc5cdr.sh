@@ -28,7 +28,7 @@ if ! [[ "$TOPK" =~ ^[0-9]+$ ]] || [ "$TOPK" -lt 1 ]; then
 fi
 
 # Parameters
-INDEX_PATH="/Users/lakshankarunathilake/PycharmProjects/sapbert/utils/NEL/indexes/sapbert_bcd5cdr_adapter_index/sapbert_bcd5cdr_adapter_index"
+INDEX_PATH="/Users/lakshankarunathilake/PycharmProjects/sapbert/utils/NEL/indexes/sapbert_bcd5cdr_decease_adapter_index/sapbert_bcd5cdr_decease_adapter_index"
 DATA_DIR="./data/bc5cdr-${DATASET_TYPE}"
 ADAPTER_PATH="/Users/lakshankarunathilake/Documents/Adapters/UMLS/sapbert-mesh-adapter"
 
