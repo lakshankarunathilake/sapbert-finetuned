@@ -334,7 +334,8 @@ class SAPBERTIndexSearcher:
         return results
 
     def batch_search(self, queries: List[str], k: int = 10) -> List[List[Dict]]:
-        return [self.search(q, k) for q in tqdm(queries, desc="Processing queries")]
+        """Batch search with scores explicitly enabled for fusion compatibility"""
+        return [self.search(q, k, return_scores=True) for q in tqdm(queries, desc="Processing queries")]
 
     # ✅ FIX 6: get_entity_by_id works for both list/dict and avoids mutating metadata
     def get_entity_by_id(self, entity_id: str) -> Optional[Dict]:

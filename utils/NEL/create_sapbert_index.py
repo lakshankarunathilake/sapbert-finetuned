@@ -390,9 +390,31 @@ class SAPBERTIndexCreator:
             raise ValueError(f"CSV must have at least 2 columns. Found {len(df.columns)} columns: {list(df.columns)}")
 
         id_column = df.columns[0]
-        aliases_column = df.columns[1]
+        cols = list(df.columns)
 
-        logger.info(f"Using columns: ID='{id_column}', Aliases='{aliases_column}'")
+        # --- Detect UMLS enriched CSV format ---
+        # Expected: CUI, SemanticGroups, SemanticTypes, Definition, Terms
+        # or any subset e.g. CUI, SemanticGroups, SemanticTypes, Terms
+        #                  or CUI, Definition, Terms
+        #                  or CUI, Terms  (original format)
+        semantic_groups_col = next((c for c in cols if c.lower() == "semanticgroups"), None)
+        semantic_types_col  = next((c for c in cols if c.lower() == "semantictypes"), None)
+        definition_col      = next((c for c in cols if c.lower() == "definition"), None)
+        # Terms column is always the last column, or explicitly named "Terms"
+        terms_col = next((c for c in cols if c.lower() == "terms"), None) or cols[-1]
+
+        is_umls_format = any([semantic_groups_col, semantic_types_col, definition_col])
+
+        if is_umls_format:
+            logger.info("Detected UMLS enriched CSV format")
+            logger.info(f"  ID column        : {id_column}")
+            logger.info(f"  SemanticGroups   : {semantic_groups_col or 'not present'}")
+            logger.info(f"  SemanticTypes    : {semantic_types_col or 'not present'}")
+            logger.info(f"  Definition       : {definition_col or 'not present'}")
+            logger.info(f"  Terms (aliases)  : {terms_col}")
+        else:
+            logger.info(f"Using standard format: ID='{id_column}', Aliases='{terms_col}'")
+
         logger.info(f"Loaded {len(df)} rows")
 
         processed_data = []
@@ -401,28 +423,38 @@ class SAPBERTIndexCreator:
         logger.info("Processing aliases...")
         for idx, row in tqdm(df.iterrows(), total=len(df), desc="Processing rows"):
             entity_id = str(row[id_column]).strip()
-            aliases_str = str(row[aliases_column]) if not pd.isna(row[aliases_column]) else ""
-
             if not entity_id or entity_id.lower() in ['nan', 'none', '']:
                 continue
 
+            aliases_str = str(row[terms_col]) if not pd.isna(row[terms_col]) else ""
             aliases = self._preprocess_aliases(aliases_str, entity_id)
             if not aliases:
                 continue
 
+            # Extract meta fields (UMLS enrichment)
+            semantic_groups = str(row[semantic_groups_col]).strip() if semantic_groups_col and not pd.isna(row[semantic_groups_col]) else ""
+            semantic_types  = str(row[semantic_types_col]).strip()  if semantic_types_col  and not pd.isna(row[semantic_types_col])  else ""
+            definition      = str(row[definition_col]).strip()      if definition_col      and not pd.isna(row[definition_col])      else ""
+
             for alias in aliases:
                 all_texts.append(alias)
                 processed_data.append({
-                    'entity_id': entity_id,
-                    'primary_alias': alias,
-                    'all_aliases': aliases,
+                    'entity_id':        entity_id,
+                    'primary_alias':    alias,
+                    'all_aliases':      aliases,
                     'original_aliases': aliases_str,
-                    'processed_text': alias,
-                    'index_id': len(processed_data)
+                    'processed_text':   alias,
+                    'index_id':         len(processed_data),
+                    # Meta — empty strings when not present in CSV
+                    'semantic_groups':  semantic_groups,
+                    'semantic_types':   semantic_types,
+                    'definition':       definition,
                 })
 
         logger.info(
-            f"Processed {len(processed_data)} alias entries from {len(set([d['entity_id'] for d in processed_data]))} unique entities")
+            f"Processed {len(processed_data)} alias entries from "
+            f"{len(set([d['entity_id'] for d in processed_data]))} unique entities"
+        )
 
         if len(processed_data) == 0:
             raise ValueError("No valid entries found after processing. Check your CSV format and data.")
@@ -434,30 +466,32 @@ class SAPBERTIndexCreator:
         logger.info(f"Building {index_type} index...")
         index = self._build_faiss_index(embeddings, index_type)
 
-        # ✅ FIX 3: metadata should be LIST aligned with FAISS ids
         metadata = processed_data
 
         index_path = os.path.join(output_dir, index_name)
         config = {
-            'index_type': index_type,
-            'model_name': self.model_name,
-            'adapter_name': self.adapter_name,
-            'adapter_path': self.adapter_path,
-            'use_adapter': self.use_adapter,
-            'embedding_dim': self.embedding_dim,
-            'num_entities': len(processed_data),
-            'created_at': time.strftime('%Y-%m-%d %H:%M:%S'),
+            'index_type':       index_type,
+            'model_name':       self.model_name,
+            'adapter_name':     self.adapter_name,
+            'adapter_path':     self.adapter_path,
+            'use_adapter':      self.use_adapter,
+            'embedding_dim':    self.embedding_dim,
+            'num_entities':     len(processed_data),
+            'created_at':       time.strftime('%Y-%m-%d %H:%M:%S'),
             'processing_time_minutes': (time.time() - start_time) / 60,
-            'max_length': max_length,
+            'max_length':       max_length,
             'source_columns': {
-                'id_column': id_column,
-                'aliases_column': aliases_column
+                'id_column':              id_column,
+                'aliases_column':         terms_col,
+                'semantic_groups_column': semantic_groups_col,
+                'semantic_types_column':  semantic_types_col,
+                'definition_column':      definition_col,
             },
-
-            # ✅ FIX 4: record normalization/pooling/metric assumptions
-            'normalized': True,
-            'metric': 'inner_product',
-            'pooling': 'cls',
+            'umls_format':      is_umls_format,
+            'meta_fields':      ['semantic_groups', 'semantic_types', 'definition'],
+            'normalized':       True,
+            'metric':           'inner_product',
+            'pooling':          'cls',
             'per_alias_indexing': True,
         }
 

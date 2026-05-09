@@ -1,0 +1,11 @@
+python umls_synonyms_export.py "/Users/lakshankarunathilake/Documents/UMLS dataset/2025AA 2/META/MRCONSO.RRF" \
+  --out output/umls_entities_bioASQ.csv \
+  --mrsty "/Users/lakshankarunathilake/Documents/UMLS dataset/2025AA 2/META/MRSTY.RRF" \
+  --mrdef "/Users/lakshankarunathilake/Documents/UMLS dataset/2025AA 2/META/MRDEF.RRF" \
+  --semantic-group ANATOMY,CHEM,DEVICE,DISO,FINDING,INJURY_POISONING,LABPROC,PHYS \
+  --lat ENG \
+  --sab ALL \
+  --prefer-preferred-first \
+  --include-sty \
+  --include-def \
+  --min-terms 1
