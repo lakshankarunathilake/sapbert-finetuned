@@ -521,8 +521,8 @@ def extract_candidates_and_scores(search_results: List[List[Dict]]) -> Tuple[
                      (r.get('aliases', [''])[0] if r.get('aliases') else '') or
                      (r.get('all_aliases', [''])[0] if r.get('all_aliases') else ''))
 
-            # Extract score - try multiple possible keys
-            score = r.get('score', r.get('similarity', r.get('distance', None)))
+            # Extract score - try multiple possible keys (including similarity_score from SAPBERTIndexSearcher)
+            score = r.get('score', r.get('similarity', r.get('similarity_score', r.get('distance', None))))
 
             if entity_id and alias:
                 cand_aliases.append(alias)
@@ -1271,3 +1271,4 @@ def main():
 
 if __name__ == "__main__":
     main()
+

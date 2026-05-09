@@ -9,7 +9,7 @@ RETRIEVER_ADAPTER_PATH="/Users/lakshankarunathilake/Documents/Adapters/UMLS/sapb
 FAISS_INDEX_PATH="/Users/lakshankarunathilake/PycharmProjects/sapbert/utils/NEL/indexes/sapbert_bcd5cdr_adapter_index/sapbert_bcd5cdr_adapter_index"
 RERANK_ADAPTER_NAME="link_rerank"
 CATEGORY="Disease"
-EPOCHS=10
+EPOCHS=5
 BATCH_SIZE=2
 LR=5e-5
 QUERY_MODE="context"
@@ -23,7 +23,7 @@ CONTEXT_WINDOW_CHARS=250
 #   0.7 = 70% retrieval, 30% reranker (balanced)
 #   0.5 = 50% retrieval, 50% reranker (equal weight)
 #   0.0 = pure reranker (original behavior, may hurt Acc@1)
-FUSION_ALPHAS=(0.5 0.7 0.8 0.9 0.95)
+FUSION_ALPHAS=(0.7)
 
 echo "=========================================="
 echo "BC5CDR Reranker Training - Fusion Alpha Grid Search"
