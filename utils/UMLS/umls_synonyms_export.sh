@@ -2,6 +2,7 @@ python umls_synonyms_export.py "/Users/lakshankarunathilake/Documents/UMLS datas
   --out output/umls_entities_bioASQ.csv \
   --mrsty "/Users/lakshankarunathilake/Documents/UMLS dataset/2025AA 2/META/MRSTY.RRF" \
   --mrdef "/Users/lakshankarunathilake/Documents/UMLS dataset/2025AA 2/META/MRDEF.RRF" \
+  --lrabr '/Users/lakshankarunathilake/Documents/UMLS dataset/2025AA 2/LRABR' \
   --semantic-group ANATOMY,CHEM,DEVICE,DISO,FINDING,INJURY_POISONING,LABPROC,PHYS \
   --lat ENG \
   --sab ALL \

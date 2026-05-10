@@ -3,7 +3,7 @@
 UMLS MeSH Category Synonym Exporter
 
 Reads UMLS Metathesaurus MRCONSO.RRF and exports synonyms with optional
-semantic type, semantic group, and definition enrichment.
+semantic type, semantic group, definition, and abbreviation enrichment.
 
 Output CSV columns (configurable):
 CUI, [SemanticGroups], [SemanticTypes], [Definition], Terms
@@ -13,6 +13,7 @@ Key features:
 - Uses MRHIER to whitelist CUIs by MeSH category
 - Uses MRSTY for semantic group/type filtering and enrichment
 - Uses MRDEF for definitions
+- Uses LRABR (SPECIALIST Lexicon) for abbreviations/acronyms
 - Filter by language (default ENG)
 - Deduplication (case & whitespace insensitive)
 - Optional preference sorting (MH/PT/PN/ISPREF first)
@@ -268,6 +269,40 @@ def load_mrdef(mrdef_path: str, allowed_sab: Optional[Set[str]] = None) -> Dict[
 
 
 # ----------------------------
+# LRABR processing (abbreviations)
+# ----------------------------
+def load_lrabr(lrabr_path: str) -> Dict[str, List[str]]:
+    """
+    Load SPECIALIST Lexicon LRABR file and return a mapping:
+        normalized_expansion → [abbreviation, ...]
+
+    LRABR format (pipe-separated):
+        abbreviation | expansion | type | ...
+    where type is typically 'a' (abbreviation) or 'A' (acronym).
+
+    The expansion is matched case-insensitively against the terms collected
+    from MRCONSO so that abbreviations can be appended as extra aliases.
+    """
+    # expansion (lowercased) → set of abbreviations
+    expansion_to_abbrs: Dict[str, Set[str]] = defaultdict(set)
+    total_lines = get_file_lines(lrabr_path)
+
+    with open_file(lrabr_path) as f:
+        for line in tqdm(f, total=total_lines, desc="Reading LRABR (abbreviations)", unit="lines"):
+            parts = line.rstrip("\n").split("|")
+            if len(parts) < 2:
+                continue
+            abbr      = parts[0].strip()
+            expansion = parts[1].strip()
+            if not abbr or not expansion:
+                continue
+            expansion_to_abbrs[normalize_term(expansion)].add(abbr)
+
+    # Convert sets → sorted lists for deterministic output
+    return {k: sorted(v) for k, v in expansion_to_abbrs.items()}
+
+
+# ----------------------------
 # MRCONSO processing
 # ----------------------------
 def parse_mrconso_line(line: str) -> Optional[Dict[str, str]]:
@@ -342,10 +377,14 @@ def process_mrconso_streaming(
     allowed_cuis: Optional[Set[str]] = None,
     sty_map: Optional[Dict[str, Dict]] = None,
     def_map: Optional[Dict[str, str]] = None,
+    lrabr_map: Optional[Dict[str, List[str]]] = None,
 ) -> Generator[List[str], None, None]:
     """
     Process MRCONSO and yield rows:
     [identifier, semantic_groups, semantic_types, definition, term1, term2, ...]
+
+    If lrabr_map is provided, abbreviations whose expansions match any collected
+    term for a given entity are appended as additional aliases before deduplication.
     """
     by_identifier: Dict[str, List[Tuple[str, bool]]] = defaultdict(list)
     cui_for_identifier: Dict[str, str] = {}
@@ -373,7 +412,23 @@ def process_mrconso_streaming(
             by_identifier[identifier].append((record["STR"], is_preferred))
 
     for identifier in tqdm(by_identifier.keys(), desc="Processing identifiers", unit="id"):
-        processed = process_identifier_terms(by_identifier[identifier], prefer_preferred_first, min_terms)
+        terms = list(by_identifier[identifier])
+
+        # --- Append abbreviations from LRABR ---
+        if lrabr_map:
+            # Collect normalised forms of all terms already found for this entity
+            existing_norms: Set[str] = {normalize_term(t) for t, _ in terms}
+            abbrs_to_add: Set[str] = set()
+            for norm in existing_norms:
+                for abbr in lrabr_map.get(norm, []):
+                    abbr_norm = normalize_term(abbr)
+                    if abbr_norm and abbr_norm not in existing_norms:
+                        abbrs_to_add.add(abbr)
+            # Abbreviations are added as non-preferred (is_preferred=False)
+            for abbr in sorted(abbrs_to_add):
+                terms.append((abbr, False))
+
+        processed = process_identifier_terms(terms, prefer_preferred_first, min_terms)
         if not processed:
             continue
 
@@ -440,7 +495,7 @@ def write_csv_streaming(
 # ----------------------------
 def main():
     parser = argparse.ArgumentParser(
-        description="Export UMLS synonyms with optional semantic type, group, and definition enrichment.",
+        description="Export UMLS synonyms with optional semantic type, group, definition, and abbreviation enrichment.",
         formatter_class=argparse.RawDescriptionHelpFormatter,
         epilog="""
 Examples:
@@ -469,6 +524,7 @@ Examples:
     parser.add_argument("--mrhier", help="Path to MRHIER.RRF (required for --mesh-category)")
     parser.add_argument("--mrsty",  help="Path to MRSTY.RRF (required for --include-sty or --semantic-group)")
     parser.add_argument("--mrdef",  help="Path to MRDEF.RRF (required for --include-def)")
+    parser.add_argument("--lrabr",  help="Path to SPECIALIST Lexicon LRABR file for abbreviation/acronym enrichment")
 
     # Filters
     parser.add_argument("--mesh-category",
@@ -516,7 +572,8 @@ Examples:
         parser.error("--mrdef is required when using --include-def")
     if args.semantic_group and not args.mrsty:
         parser.error("--mrsty is required when using --semantic-group")
-    for label, path in [("MRHIER", args.mrhier), ("MRSTY", args.mrsty), ("MRDEF", args.mrdef)]:
+    for label, path in [("MRHIER", args.mrhier), ("MRSTY", args.mrsty),
+                        ("MRDEF", args.mrdef), ("LRABR", args.lrabr)]:
         if path and not os.path.exists(path):
             parser.error(f"{label} file not found: {path}")
 
@@ -553,6 +610,11 @@ Examples:
     if def_map:
         print(f"Loaded definitions for {len(def_map):,} CUIs")
 
+    lrabr_map = None
+    if args.lrabr:
+        lrabr_map = load_lrabr(args.lrabr)
+        print(f"Loaded LRABR abbreviations for {len(lrabr_map):,} unique expansions")
+
     print(f"\nProcessing MRCONSO : {args.mrconso}")
     print(f"Output             : {args.out}")
     print(f"Language           : {lat_filter or 'ALL'}")
@@ -560,6 +622,7 @@ Examples:
     print(f"TTY filter         : {allowed_tty or 'ALL'}")
     print(f"Include STY        : {args.include_sty}")
     print(f"Include definition : {args.include_def}")
+    print(f"Include LRABR abbr : {args.lrabr is not None}")
     print(f"Use source ID      : {args.use_source_id}")
     print(f"Preferred-first    : {args.prefer_preferred_first}")
     print(f"Min terms          : {args.min_terms}")
@@ -578,6 +641,7 @@ Examples:
         allowed_cuis=allowed_cuis,
         sty_map=sty_map,
         def_map=def_map,
+        lrabr_map=lrabr_map,
     )
 
     write_csv_streaming(args.out, rows_gen, args.use_source_id, args.include_sty, args.include_def)
