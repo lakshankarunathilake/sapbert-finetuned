@@ -8,10 +8,10 @@
 CSV_PATH="/Users/lakshankarunathilake/PycharmProjects/sapbert/utils/UMLS/output/umls_entities_bioASQ.csv"
 MODEL_NAME="microsoft/BiomedNLP-PubMedBERT-base-uncased-abstract-fulltext"
 ADAPTER_PATH="/Users/lakshankarunathilake/Documents/Adapters/UMLS/sapbert-mesh-adapter"
-OUTPUT_DIR="/Users/lakshankarunathilake/PycharmProjects/sapbert/utils/NEL/indexes/bioASQ_index"
+OUTPUT_DIR="/Users/lakshankarunathilake/PycharmProjects/sapbert/utils/NEL/indexes/bioASQ_index_20260510"
 INDEX_NAME="bioASQ_index"
 MAX_LENGTH=25
-BATCH_SIZE=32
+BATCH_SIZE=64
 VERBOSE="--verbose"
 
 # Allow overrides from command line

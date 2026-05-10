@@ -56,31 +56,30 @@ MESH_CATEGORY_PREFIX = {
 }
 
 # ----------------------------
-# Semantic Group → TUI mapping
+# Semantic Group → TUI mapping  (custom buckets aligned with semGroups.txt TUIs)
 # ----------------------------
 SEMANTIC_GROUP_TUIS = {
-    "ANATOMY": {
+    "ANATOMY": {                          # ← semGroups ANAT
         "T017", "T029", "T023", "T030", "T031", "T022",
-        "T025", "T026", "T018", "T021", "T024"
+        "T025", "T026", "T018", "T021", "T024",
     },
-    "CHEM": {
+    "CHEM": {                             # ← semGroups CHEM (removed phantom T111/T119/T124/T115/T110/T020)
         "T116", "T195", "T123", "T122", "T103", "T120", "T104", "T200",
-        "T111", "T196", "T126", "T131", "T125", "T129", "T130", "T197",
-        "T119", "T124", "T114", "T109", "T115", "T121", "T192", "T110",
-        "T127", "T020"
+        "T196", "T126", "T131", "T125", "T129", "T130", "T197",
+        "T114", "T109", "T121", "T192", "T127",
     },
-    "DEVICE": {"T074", "T075", "T073", "T072", "T167", "T168", "T071"},
-    "DISO": {
-        "T047", "T048", "T191", "T046", "T184", "T049",
-        "T050", "T190", "T019"
+    "DEVICE": {"T203", "T074", "T075"},   # ← semGroups DEVI (removed OBJC TUIs, added T203)
+    "DISO": {                             # ← semGroups DISO (added missing T020, T033, T037)
+        "T020", "T190", "T049", "T019", "T047", "T050",
+        "T048", "T191", "T046", "T184",
     },
-    "FINDING":          {"T033"},
-    "INJURY_POISONING": {"T037"},
-    "LABPROC":          {"T059"},
-    "PHYS": {
+    "FINDING":          {"T033"},         # ← shared with DISO
+    "INJURY_POISONING": {"T037"},         # ← shared with DISO
+    "LABPROC":          {"T060", "T065", "T058", "T059", "T063", "T062", "T061"},         # ← shared with PROCEDURES
+    "PHYS": {                             # ← semGroups PHYS (removed T038 which is PHEN)
         "T039", "T040", "T041", "T042", "T043", "T044",
-        "T045", "T038", "T032", "T201"
-    },
+        "T045", "T032", "T201",
+    }
 }
 
 # TUI → human-readable group label (for output columns)
@@ -89,23 +88,6 @@ for _group, _tuis in SEMANTIC_GROUP_TUIS.items():
     for _tui in _tuis:
         TUI_TO_GROUP[_tui] = _group
 
-# Additional TUIs not in our filter groups but useful for labelling
-_EXTRA_TUI_GROUP = {
-    "T007": "LIVING_BEINGS", "T204": "LIVING_BEINGS", "T194": "LIVING_BEINGS",
-    "T008": "LIVING_BEINGS", "T010": "LIVING_BEINGS", "T011": "LIVING_BEINGS",
-    "T012": "LIVING_BEINGS", "T013": "LIVING_BEINGS", "T014": "LIVING_BEINGS",
-    "T015": "LIVING_BEINGS", "T016": "LIVING_BEINGS",
-    "T060": "PROCEDURES", "T065": "PROCEDURES", "T058": "PROCEDURES",
-    "T063": "PROCEDURES", "T062": "PROCEDURES", "T061": "PROCEDURES",
-    "T093": "ORGANIZATIONS", "T092": "ORGANIZATIONS", "T094": "ORGANIZATIONS",
-    "T095": "ORGANIZATIONS",
-    "T078": "CONCEPTS", "T079": "CONCEPTS", "T080": "CONCEPTS",
-    "T081": "CONCEPTS", "T082": "CONCEPTS", "T083": "CONCEPTS",
-    "T170": "CONCEPTS", "T185": "CONCEPTS", "T169": "CONCEPTS",
-    "T001": "LIVING_BEINGS", "T002": "LIVING_BEINGS", "T004": "LIVING_BEINGS",
-    "T005": "LIVING_BEINGS", "T006": "LIVING_BEINGS",
-}
-TUI_TO_GROUP.update({k: v for k, v in _EXTRA_TUI_GROUP.items() if k not in TUI_TO_GROUP})
 
 
 def normalize_category(cat: str) -> str:
